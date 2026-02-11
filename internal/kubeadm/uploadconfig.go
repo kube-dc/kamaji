@@ -4,6 +4,7 @@
 package kubeadm
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/blang/semver"
@@ -30,6 +31,12 @@ const (
 // minVerUnversionedKubeletConfig defines minimum version from which kubeadm uses kubelet-config as a ConfigMap name.
 var minVerUnversionedKubeletConfig = semver.MustParse("1.24.0")
 
+// minVerCrashLoopBackOff defines the minimum version that supports crashLoopBackOff kubelet config.
+var minVerCrashLoopBackOff = semver.MustParse("1.35.0")
+
+// minVerImagePullCredentialsVerification defines the minimum version that supports imagePullCredentialsVerificationPolicy.
+var minVerImagePullCredentialsVerification = semver.MustParse("1.35.0")
+
 func UploadKubeadmConfig(client kubernetes.Interface, config *Configuration) ([]byte, error) {
 	return nil, uploadconfig.UploadConfiguration(&config.InitConfiguration, client)
 }
@@ -41,7 +48,7 @@ func UploadKubeletConfig(client kubernetes.Interface, config *Configuration, pat
 		TenantControlPlaneCgroupDriver:  config.Parameters.TenantControlPlaneCGroupDriver,
 	}
 
-	content, err := getKubeletConfigmapContent(kubeletConfiguration, patches)
+	content, err := getKubeletConfigmapContent(kubeletConfiguration, config.Parameters.TenantControlPlaneVersion, patches)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +79,7 @@ func UploadKubeletConfig(client kubernetes.Interface, config *Configuration, pat
 	return nil, nil
 }
 
-func getKubeletConfigmapContent(kubeletConfiguration KubeletConfiguration, patch jsonpatchv5.Patch) ([]byte, error) {
+func getKubeletConfigmapContent(kubeletConfiguration KubeletConfiguration, tenantVersion string, patch jsonpatchv5.Patch) ([]byte, error) {
 	var kc kubelettypes.KubeletConfiguration
 
 	kubeletv1beta1.SetDefaults_KubeletConfiguration(&kc)
@@ -94,6 +101,19 @@ func getKubeletConfigmapContent(kubeletConfiguration KubeletConfiguration, patch
 	// determine the resolvConf location, as reported in clastix/kamaji#581.
 	kc.ResolverConfig = nil
 
+	// Strip fields that are not supported by the target kubelet version.
+	// This allows a single Kamaji controller (built with v1.35+ libs) to serve
+	// tenant clusters running older Kubernetes versions (e.g. v1.34).
+	if parsedVersion, parseErr := semver.ParseTolerant(tenantVersion); parseErr == nil {
+		targetMinor := semver.Version{Major: parsedVersion.Major, Minor: parsedVersion.Minor}
+		if targetMinor.LT(minVerCrashLoopBackOff) {
+			kc.CrashLoopBackOff = kubelettypes.CrashLoopBackOffConfig{}
+		}
+		if targetMinor.LT(minVerImagePullCredentialsVerification) {
+			kc.ImagePullCredentialsVerificationPolicy = ""
+		}
+	}
+
 	if len(patch) > 0 {
 		kubeletConfig, patchErr := utilities.EncodeToJSON(&kc)
 		if patchErr != nil {
@@ -109,7 +129,22 @@ func getKubeletConfigmapContent(kubeletConfiguration KubeletConfiguration, patch
 		}
 	}
 
-	return utilities.EncodeToYaml(&kc)
+	yamlBytes, encErr := utilities.EncodeToYaml(&kc)
+	if encErr != nil {
+		return nil, encErr
+	}
+
+	// Go's omitempty does not omit empty structs, so crashLoopBackOff: {}
+	// still appears in the serialized output. Strip it for older versions
+	// whose kubelets would reject the unknown/feature-gated field.
+	if parsedVersion, parseErr := semver.ParseTolerant(tenantVersion); parseErr == nil {
+		targetMinor := semver.Version{Major: parsedVersion.Major, Minor: parsedVersion.Minor}
+		if targetMinor.LT(minVerCrashLoopBackOff) {
+			yamlBytes = bytes.ReplaceAll(yamlBytes, []byte("crashLoopBackOff: {}\n"), nil)
+		}
+	}
+
+	return yamlBytes, nil
 }
 
 func createConfigMapRBACRules(client kubernetes.Interface, configMapName string) error {
