@@ -392,6 +392,15 @@ func (d Deployment) buildScheduler(podSpec *corev1.PodSpec, tenantControlPlane k
 	default:
 		podSpec.Containers[index].Resources = corev1.ResourceRequirements{}
 	}
+	// In-place vertical scaling: let VPA adjust both CPU and memory without
+	// restarting the container. Default for memory is RestartContainer, which
+	// causes a kube-scheduler restart on every memory recommendation update;
+	// combined with a 1-second probe timeout that's the kill loop documented
+	// in kube-dc-k8-manager/internal/controller/kdccluster_vpa.go.
+	podSpec.Containers[index].ResizePolicy = []corev1.ContainerResizePolicy{
+		{ResourceName: corev1.ResourceCPU, RestartPolicy: corev1.NotRequired},
+		{ResourceName: corev1.ResourceMemory, RestartPolicy: corev1.NotRequired},
+	}
 	// Volume mounts
 	var extraVolumeMounts []corev1.VolumeMount
 
@@ -482,6 +491,11 @@ func (d Deployment) buildControllerManager(podSpec *corev1.PodSpec, tenantContro
 		podSpec.Containers[index].Resources = *tenantControlPlane.Spec.ControlPlane.Deployment.Resources.ControllerManager
 	default:
 		podSpec.Containers[index].Resources = corev1.ResourceRequirements{}
+	}
+	// In-place vertical scaling: see scheduler block above.
+	podSpec.Containers[index].ResizePolicy = []corev1.ContainerResizePolicy{
+		{ResourceName: corev1.ResourceCPU, RestartPolicy: corev1.NotRequired},
+		{ResourceName: corev1.ResourceMemory, RestartPolicy: corev1.NotRequired},
 	}
 	// Volume mounts
 	var extraVolumeMounts []corev1.VolumeMount
@@ -656,6 +670,11 @@ func (d Deployment) buildKubeAPIServer(podSpec *corev1.PodSpec, tenantControlPla
 		podSpec.Containers[index].Resources = *tenantControlPlane.Spec.ControlPlane.Deployment.Resources.APIServer
 	default:
 		podSpec.Containers[index].Resources = corev1.ResourceRequirements{}
+	}
+	// In-place vertical scaling: see scheduler block above.
+	podSpec.Containers[index].ResizePolicy = []corev1.ContainerResizePolicy{
+		{ResourceName: corev1.ResourceCPU, RestartPolicy: corev1.NotRequired},
+		{ResourceName: corev1.ResourceMemory, RestartPolicy: corev1.NotRequired},
 	}
 }
 
