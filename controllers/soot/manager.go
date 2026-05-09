@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
@@ -188,6 +190,26 @@ func (m *Manager) tenantHealthWatchdog(
 	}
 }
 
+// deploymentNotAvailable returns true when the rendered Deployment
+// either does not exist, has spec.replicas==0, or has no available
+// replicas. This is the kube-dc lifecycle pause indicator: the
+// orchestrator scales the Deployment to 0 without touching tcp.Spec,
+// so tcp.Status can stay stale at Ready. Reading the Deployment
+// directly avoids that staleness.
+func (m *Manager) deploymentNotAvailable(ctx context.Context, tcp *kamajiv1alpha1.TenantControlPlane) bool {
+	dep := &appsv1.Deployment{}
+	if err := m.AdminClient.Get(ctx, types.NamespacedName{Namespace: tcp.Namespace, Name: tcp.Name}, dep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+		log.FromContext(ctx).V(2).Info("cannot read Deployment for soot gate, assuming available", "err", err.Error())
+
+		return false
+	}
+
+	return ptr.Deref(dep.Spec.Replicas, 0) == 0 || dep.Status.AvailableReplicas == 0
+}
+
 func (m *Manager) cleanup(ctx context.Context, req reconcile.Request, tenantControlPlane *kamajiv1alpha1.TenantControlPlane) (err error) {
 	if tenantControlPlane != nil && controllerutil.ContainsFinalizer(tenantControlPlane, finalizers.SootFinalizer) {
 		defer func() {
@@ -297,6 +319,14 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 			// we don't want to pollute with messages due to broken connection.
 			// Once the TCP will be ready again, the event will be intercepted and the manager started back.
 			return reconcile.Result{}, m.cleanup(ctx, request, tcp)
+		case m.deploymentNotAvailable(ctx, tcp):
+			// External pause path: rendered Deployment has been scaled
+			// to 0 (or has no available replicas) but tcp.Spec replicas
+			// is non-zero, so tcpStatus may still report Ready. Tear
+			// down the soot manager to stop informer retry spam against
+			// the unreachable tenant API. The Deployment-update event
+			// will re-trigger reconcile when replicas come back.
+			return reconcile.Result{}, m.cleanup(ctx, request, tcp)
 		default:
 			for _, trigger := range v.triggers {
 				var shrunkTCP kamajiv1alpha1.TenantControlPlane
@@ -314,6 +344,19 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 	// enqueuing back is not required since we're going to get that event once ready.
 	if tcpStatus == kamajiv1alpha1.VersionNotReady || tcpStatus == kamajiv1alpha1.VersionCARotating || tcpStatus == kamajiv1alpha1.VersionSleeping {
 		log.FromContext(ctx).Info("skipping start of the soot manager for a not ready instance")
+
+		return reconcile.Result{}, nil
+	}
+	// Independent of tcp.Status (which can be stale when an external
+	// orchestrator scales the rendered Deployment to 0 without touching
+	// tcp.Spec.ControlPlane.Deployment.Replicas), check the actual
+	// Deployment. If it has no available replicas the tenant API is
+	// unreachable and starting a soot manager just generates retry spam
+	// for ~3 minutes per cycle until cache-sync timeout. Skip and wait
+	// for the Deployment-update event to re-trigger reconcile when
+	// replicas come back.
+	if m.deploymentNotAvailable(ctx, tcp) {
+		log.FromContext(ctx).Info("skipping start of the soot manager: rendered Deployment has no available replicas")
 
 		return reconcile.Result{}, nil
 	}
