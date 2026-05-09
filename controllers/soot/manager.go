@@ -9,6 +9,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
@@ -80,6 +81,113 @@ func (m *Manager) retrieveTenantControlPlane(ctx context.Context, request reconc
 
 // If the TenantControlPlane is deleted we have to free up memory by stopping the soot manager:
 // this is made possible by retrieving the cancel function of the soot manager context to cancel it.
+// watchdogProbeInterval is how often the per-TCP watchdog probes the
+// tenant API. 30s matches Kamaji's default reconcile cadence for
+// healthy clusters and is well below the 10s controller-runtime
+// timeout, so a healthy cluster stays unaffected.
+const watchdogProbeInterval = 30 * time.Second
+
+// watchdogMaxFailures is the number of consecutive probe failures
+// after which the per-TCP soot manager is torn down. With 30s spacing,
+// this is ~2.5 minutes of unbroken unreachability — long enough to
+// ride out a kube-apiserver restart on the tenant side, short enough
+// that a permanently-unreachable tenant doesn't keep the soot
+// informers wedged for hours.
+const watchdogMaxFailures = 5
+
+// tenantHealthWatchdog probes the per-TCP tenant API every
+// watchdogProbeInterval. After watchdogMaxFailures consecutive
+// failures it annotates the TCP with the soot-failed marker and
+// cancels the per-TCP context, which causes the existing soot manager
+// goroutine to exit and the next reconcile to rebuild the soot
+// manager from scratch.
+//
+// Background. The per-TCP source.Kind informers that the soot
+// controllers register against the tenant API retry their initial
+// list/watch indefinitely (controller-runtime behavior). When the
+// tenant apiserver becomes permanently unreachable — e.g. the tenant
+// org is suspended and its kube-apiserver pods get scaled to 0 — the
+// informers wedge. The downstream effect is that the
+// `KubernetesDeploymentResource.computeStatus` reconciler can't
+// refresh `tcp.Status.KubernetesResources.Version.Status` (it depends
+// on the same tenant connection in the soot controllers), so the
+// status never transitions to `VersionNotReady` or `VersionSleeping`,
+// and the soot manager's Reconcile-side cleanup paths
+// (lines ~280, ~290 in this file) never trigger. The watchdog closes
+// that loop by detecting the unreachability locally and forcing the
+// rebuild.
+//
+// On every successful probe the failure counter resets, so transient
+// network blips do not trigger a tear-down.
+func (m *Manager) tenantHealthWatchdog(
+	ctx context.Context,
+	request reconcile.Request,
+	tcpRest *rest.Config,
+	cancelFn context.CancelFunc,
+) {
+	logger := log.FromContext(ctx).WithValues("watchdog", request.String())
+	probeCfg := rest.CopyConfig(tcpRest)
+	probeCfg.Timeout = 5 * time.Second
+
+	clientset, err := kubernetes.NewForConfig(probeCfg)
+	if err != nil {
+		logger.Error(err, "watchdog: cannot build clientset, skipping health probes")
+
+		return
+	}
+
+	failures := 0
+	ticker := time.NewTicker(watchdogProbeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		// ServerVersion() honors probeCfg.Timeout (set above) directly
+		// via the rest.Config; no separate context needed.
+		_, probeErr := clientset.Discovery().ServerVersion()
+
+		if probeErr == nil {
+			if failures > 0 {
+				logger.V(2).Info("watchdog: tenant API reachable again", "previousFailures", failures)
+			}
+			failures = 0
+
+			continue
+		}
+
+		failures++
+		logger.V(2).Info("watchdog: tenant API probe failed", "failures", failures, "max", watchdogMaxFailures, "err", probeErr.Error())
+
+		if failures < watchdogMaxFailures {
+			continue
+		}
+
+		logger.Info("watchdog: tenant API unreachable beyond threshold, tearing down soot manager", "failures", failures)
+
+		// Annotate the TCP so the next reconcile recognizes the
+		// failed state and proceeds through the existing
+		// `sootManagerFailedAnnotation` recovery path (which re-builds
+		// the soot manager from scratch).
+		if annoErr := m.retryTenantControlPlaneAnnotations(ctx, request, func(annotations map[string]string) {
+			annotations[sootManagerAnnotation] = sootManagerFailedAnnotation
+		}); annoErr != nil {
+			logger.Error(annoErr, "watchdog: cannot annotate TCP for soot rebuild")
+		}
+
+		// Cancel the per-TCP context so the soot manager goroutine
+		// exits and `completedCh` is closed; the parent Reconcile then
+		// observes the failed annotation and rebuilds.
+		cancelFn()
+
+		return
+	}
+}
+
 func (m *Manager) cleanup(ctx context.Context, req reconcile.Request, tenantControlPlane *kamajiv1alpha1.TenantControlPlane) (err error) {
 	if tenantControlPlane != nil && controllerutil.ContainsFinalizer(tenantControlPlane, finalizers.SootFinalizer) {
 		defer func() {
@@ -392,6 +500,17 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 		}
 		close(completedCh)
 	}()
+
+	// Health watchdog: probes the tenant API every
+	// watchdogProbeInterval. On watchdogMaxFailures consecutive
+	// failures, annotates the TCP and cancels tcpCtx, forcing the
+	// soot manager goroutine above to exit and the next reconcile
+	// to rebuild. Without this, controller-runtime's source.Kind
+	// informers retry against an unreachable tenant API forever and
+	// the only TCP-status transitions that would normally trigger
+	// cleanup (VersionNotReady, VersionSleeping) never fire because
+	// they depend on a working tenant connection themselves.
+	go m.tenantHealthWatchdog(tcpCtx, request, tcpRest, tcpCancelFn)
 
 	m.sootMap[request.NamespacedName.String()] = sootItem{
 		triggers: []chan event.GenericEvent{
