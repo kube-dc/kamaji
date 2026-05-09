@@ -12,6 +12,7 @@ import (
 )
 
 // NetworkProfileSpec defines the desired state of NetworkProfile.
+// +kubebuilder:validation:XValidation:rule="!has(self.dnsServiceIPs) || self.dnsServiceIPs.all(r, cidr(self.serviceCidr).containsIP(r))",message="all DNS service IPs must be part of the Service CIDR"
 type NetworkProfileSpec struct {
 	// LoadBalancerSourceRanges restricts the IP ranges that can access
 	// the LoadBalancer type Service. This field defines a list of IP
@@ -20,15 +21,22 @@ type NetworkProfileSpec struct {
 	// This feature is useful for restricting access to API servers or services
 	// to specific networks for security purposes.
 	// Example: {"192.168.1.0/24", "10.0.0.0/8"}
+	//+kubebuilder:validation:MaxItems=16
+	//+kubebuilder:validation:XValidation:rule="self.all(r, isCIDR(r))",message="all LoadBalancer source range entries must be valid CIDR"
 	LoadBalancerSourceRanges []string `json:"loadBalancerSourceRanges,omitempty"`
 	// Specify the LoadBalancer class in case of multiple load balancer implementations.
 	// Field supported only for Tenant Control Plane instances exposed using a LoadBalancer Service.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="LoadBalancerClass is immutable"
 	LoadBalancerClass *string `json:"loadBalancerClass,omitempty"`
-	// Address where API server of will be exposed.
-	// In case of LoadBalancer Service, this can be empty in order to use the exposed IP provided by the cloud controller manager.
+	// Address where API server will be exposed.
+	// In the case of LoadBalancer Service, this can be empty in order to use the exposed IP provided by the cloud controller manager.
 	Address string `json:"address,omitempty"`
+	// AdvertiseAddress is the address advertised to tenant-side consumers (workers, konnectivity).
+	// When set, the management address is used for CAPI and status reporting, while this address
+	// is used for kubeadm ControlPlaneEndpoint, cluster-info, and admin.conf.
+	// Both addresses are included in the API server certificate SANs.
+	AdvertiseAddress string `json:"advertiseAddress,omitempty"`
 	// The default domain name used for DNS resolution within the cluster.
 	//+kubebuilder:default="cluster.local"
 	//+kubebuilder:validation:XValidation:rule="self == oldSelf",message="changing the cluster domain is not supported"
@@ -37,7 +45,7 @@ type NetworkProfileSpec struct {
 	// AllowAddressAsExternalIP will include tenantControlPlane.Spec.NetworkProfile.Address in the section of
 	// ExternalIPs of the Kubernetes Service (only ClusterIP or NodePort)
 	AllowAddressAsExternalIP bool `json:"allowAddressAsExternalIP,omitempty"`
-	// Port where API server of will be exposed
+	// Port where API server will be exposed
 	//+kubebuilder:default=6443
 	Port int32 `json:"port,omitempty"`
 	// CertSANs sets extra Subject Alternative Names (SANs) for the API Server signing certificate.
@@ -45,14 +53,20 @@ type NetworkProfileSpec struct {
 	CertSANs []string `json:"certSANs,omitempty"`
 	// CIDR for Kubernetes Services: if empty, defaulted to 10.96.0.0/16.
 	//+kubebuilder:default="10.96.0.0/16"
+	//+kubebuilder:validation:Optional
+	//+kubebuilder:validation:XValidation:rule="self == '' || isCIDR(self)",message="serviceCidr must be empty or a valid CIDR"
 	ServiceCIDR string `json:"serviceCidr,omitempty"`
 	// CIDR for Kubernetes Pods: if empty, defaulted to 10.244.0.0/16.
 	//+kubebuilder:default="10.244.0.0/16"
+	//+kubebuilder:validation:Optional
+	//+kubebuilder:validation:XValidation:rule="self == '' || isCIDR(self)",message="podCidr must be empty or a valid CIDR"
 	PodCIDR string `json:"podCidr,omitempty"`
 	// The DNS Service for internal resolution, it must match the Service CIDR.
 	// In case of an empty value, it is automatically computed according to the Service CIDR, e.g.:
 	// Service CIDR 10.96.0.0/16, the resulting DNS Service IP will be 10.96.0.10 for IPv4,
 	// for IPv6 from the CIDR 2001:db8:abcd::/64 the resulting DNS Service IP will be 2001:db8:abcd::10.
+	//+kubebuilder:validation:MaxItems=8
+	//+kubebuilder:validation:Optional
 	DNSServiceIPs []string `json:"dnsServiceIPs,omitempty"`
 }
 
@@ -155,7 +169,6 @@ type IngressSpec struct {
 }
 
 // GatewaySpec defines the options for the Gateway which will expose API Server of the Tenant Control Plane.
-// +kubebuilder:validation:XValidation:rule="!has(self.parentRefs) || size(self.parentRefs) == 0 || self.parentRefs.all(ref, !has(ref.port) && !has(ref.sectionName))",message="parentRefs must not specify port or sectionName, these are set automatically by Kamaji"
 type GatewaySpec struct {
 	// AdditionalMetadata to add Labels and Annotations support.
 	AdditionalMetadata AdditionalMetadata `json:"additionalMetadata,omitempty"`
@@ -172,6 +185,54 @@ type ControlPlaneComponentsResources struct {
 	// Define the kine container resources.
 	// Available only if Kamaji is running using Kine as backing storage.
 	Kine *corev1.ResourceRequirements `json:"kine,omitempty"`
+}
+
+// ProbeSpec defines configurable parameters for a Kubernetes probe.
+type ProbeSpec struct {
+	// InitialDelaySeconds is the number of seconds after the container has started before the probe is initiated.
+	//+kubebuilder:validation:Minimum=0
+	InitialDelaySeconds *int32 `json:"initialDelaySeconds,omitempty"`
+	// TimeoutSeconds is the number of seconds after which the probe times out.
+	//+kubebuilder:validation:Minimum=1
+	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
+	// PeriodSeconds is how often (in seconds) to perform the probe.
+	//+kubebuilder:validation:Minimum=1
+	PeriodSeconds *int32 `json:"periodSeconds,omitempty"`
+	// SuccessThreshold is the minimum consecutive successes for the probe to be considered successful.
+	// Must be 1 for liveness and startup probes.
+	//+kubebuilder:validation:Minimum=1
+	SuccessThreshold *int32 `json:"successThreshold,omitempty"`
+	// FailureThreshold is the consecutive failure count required to consider the probe failed.
+	//+kubebuilder:validation:Minimum=1
+	FailureThreshold *int32 `json:"failureThreshold,omitempty"`
+}
+
+// ProbeSet defines per-probe-type configuration.
+type ProbeSet struct {
+	// Liveness defines parameters for the liveness probe.
+	Liveness *ProbeSpec `json:"liveness,omitempty"`
+	// Readiness defines parameters for the readiness probe.
+	Readiness *ProbeSpec `json:"readiness,omitempty"`
+	// Startup defines parameters for the startup probe.
+	Startup *ProbeSpec `json:"startup,omitempty"`
+}
+
+// ControlPlaneProbes defines probe configuration for Control Plane components.
+// Global probe settings (Liveness, Readiness, Startup) apply to all components.
+// Per-component settings (APIServer, ControllerManager, Scheduler) override global settings.
+type ControlPlaneProbes struct {
+	// Liveness defines default parameters for liveness probes of all Control Plane components.
+	Liveness *ProbeSpec `json:"liveness,omitempty"`
+	// Readiness defines default parameters for the readiness probe of kube-apiserver.
+	Readiness *ProbeSpec `json:"readiness,omitempty"`
+	// Startup defines default parameters for startup probes of all Control Plane components.
+	Startup *ProbeSpec `json:"startup,omitempty"`
+	// APIServer defines probe overrides for kube-apiserver, taking precedence over global probe settings.
+	APIServer *ProbeSet `json:"apiServer,omitempty"`
+	// ControllerManager defines probe overrides for kube-controller-manager, taking precedence over global probe settings.
+	ControllerManager *ProbeSet `json:"controllerManager,omitempty"`
+	// Scheduler defines probe overrides for kube-scheduler, taking precedence over global probe settings.
+	Scheduler *ProbeSet `json:"scheduler,omitempty"`
 }
 
 type DeploymentSpec struct {
@@ -225,6 +286,10 @@ type DeploymentSpec struct {
 	// AdditionalVolumeMounts allows to mount an additional volume into each component of the Control Plane
 	// (kube-apiserver, controller-manager, and scheduler).
 	AdditionalVolumeMounts *AdditionalVolumeMounts `json:"additionalVolumeMounts,omitempty"`
+	// Probes defines the probe configuration for the Control Plane components
+	// (kube-apiserver, controller-manager, and scheduler).
+	// Override TimeoutSeconds, PeriodSeconds, and FailureThreshold for resource-constrained environments.
+	Probes *ControlPlaneProbes `json:"probes,omitempty"`
 	//+kubebuilder:default="default"
 	// ServiceAccountName allows to specify the service account to be mounted to the pods of the Control plane deployment
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
@@ -447,8 +512,4 @@ type TenantControlPlaneList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []TenantControlPlane `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&TenantControlPlane{}, &TenantControlPlaneList{})
 }

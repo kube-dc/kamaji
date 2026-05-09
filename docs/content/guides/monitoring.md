@@ -1,10 +1,55 @@
-# Tenant Control Plane Monitoring
+# Monitoring
 
-Kamaji exposes a set of metrics that can be used to monitor the health of the Tenant Control Plane (TCP) and its components. The metrics are exposed in Prometheus format and can be scraped by a Prometheus server instance running in the Management Cluster.
-
+Kamaji exposes metrics for both the management plane (Kamaji controllers) and Tenant Control Plane (TCP) components. Metrics are exposed in Prometheus format and can be scraped from the management cluster.
 
 ## Prerequisites
 Ensure you have installed the [Prometheus Operator](https://prometheus.io/community/) in the Management Cluster and that it is configured properly. You should verify that Service Monitor CRDs are installed in the Management Cluster as they are used to tell Prometheus how to scrape the metrics from the TCP.
+
+## Kamaji management-plane metrics
+
+Kamaji exposes management-plane metrics from the controller-manager `/metrics` endpoint. You can scrape this endpoint with Prometheus and use the metrics to monitor `TenantControlPlanes`, `DataStores`, certificate lifecycle, handler latency, and build metadata.
+
+The custom Kamaji metrics are:
+
+- `kamaji_tenant_control_plane_info`
+- `kamaji_tenant_control_plane_status`
+- `kamaji_tenant_control_planes_current`
+- `kamaji_datastore_info`
+- `kamaji_datastore_status`
+- `kamaji_datastores_current`
+- `kamaji_certificates_current`
+- `kamaji_handler_time_seconds`
+- `kamaji_build_info`
+
+In addition, Kamaji also exposes the default Go runtime and controller-runtime metrics.
+
+To enable scraping, create a `ServiceMonitor` like the following:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kamaji
+  namespace: default
+spec:
+  namespaceSelector:
+    matchNames:
+      - kamaji-system
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: kamaji
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+```
+
+A ready-to-use Grafana dashboard for these metrics is available [here](https://raw.githubusercontent.com/clastix/kamaji/master/config/observability/dashboard/grafana-dashboard-kamaji.json).
+
+![Kamaji Monitoring Dashboard](../images/kamaji-monitoring-dashboard.png)
+
+## Tenant Control Plane component metrics
 
 ## Enable metrics scraping
 
@@ -201,9 +246,20 @@ kubeScheduler:
 
 ## Grafana
 
-**Grafana** is a widely used tool for visualizing metrics. You can create custom dashboards for Tenant Control Planes and visualize the metrics scraped by Prometheus. The Prometheus Operator Helm Chart also installs Grafana with a set of predefined dashboards for Kubernetes Control Plane components: `kube-apiserver`, `kube-scheduler`, and `kube-controller-manager`. These dashboards can serve as a starting point for creating custom dashboards for Tenant Control Planes or can be used as-is.
+**Grafana** is a widely used tool for visualizing metrics. You can create custom dashboards for Tenant Control Planes and visualize the metrics scraped by Prometheus. When using `kube-prometheus-stack`, Grafana can also be installed with a set of predefined dashboards for Kubernetes Control Plane components: `kube-apiserver`, `kube-scheduler`, and `kube-controller-manager`. These dashboards can serve as a starting point for creating custom dashboards for Tenant Control Planes or can be used as-is, provided that the scraped metrics use the labels expected by those dashboards.
 
 !!! tip "Multi-Cluster Mode"
-    In Grafana, enable the "Multi-Cluster Mode" option for improved visualization of metrics. This option is available in the Grafana settings.
+    When using the predefined `kube-prometheus-stack` dashboards to visualize multiple Tenant Control Planes, enable the multi-cluster dashboard mode in the chart values:
+
+    ```yaml
+    grafana:
+      sidecar:
+        dashboards:
+          multicluster:
+            global:
+              enabled: true
+    ```
+
+    This exposes the `cluster` variable in the dashboards. Each Tenant Control Plane `ServiceMonitor` should relabel scraped metrics with a unique `cluster` value, for example the Tenant Control Plane name, and with the standard Control Plane `job` labels expected by the dashboards: `apiserver`, `kube-scheduler`, and `kube-controller-manager`.
 
 That's it!

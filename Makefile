@@ -47,6 +47,9 @@ GOLANGCI_LINT  ?= $(LOCALBIN)/golangci-lint
 HELM           ?= $(LOCALBIN)/helm
 KIND           ?= $(LOCALBIN)/kind
 KO             ?= $(LOCALBIN)/ko
+GORELEASER     ?= $(LOCALBIN)/goreleaser
+COSIGN         ?= $(LOCALBIN)/cosign
+SYFT           ?= $(LOCALBIN)/syft
 YQ             ?= $(LOCALBIN)/yq
 ENVTEST        ?= $(LOCALBIN)/setup-envtest
 
@@ -68,7 +71,33 @@ all: build
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
+##@ Documentation
+
+.PHONY: docs
+docs: ## Serve documentation locally with Docker.
+	docker run --rm -it \
+		-p 8000:8000 \
+		-v "$${PWD}/docs":/docs:Z \
+		-w /docs \
+		squidfunk/mkdocs-material \
+		serve -a 0.0.0.0:8000
+
 ##@ Binary
+
+.PHONY: cosign
+cosign: $(COSIGN) ## Download cosign locally if necessary.
+$(COSIGN): $(LOCALBIN)
+	test -s $(LOCALBIN)/cosign || GOBIN=$(LOCALBIN) go install github.com/sigstore/cosign/v3/cmd/cosign@v3.0.5
+
+.PHONY: syft
+syft: $(SYFT) ## Download syft locally if necessary.
+$(SYFT): $(LOCALBIN)
+	test -s $(LOCALBIN)/syft || GOBIN=$(LOCALBIN) go install github.com/anchore/syft/cmd/syft@v1.42.1
+
+.PHONY: goreleaser
+goreleaser: $(GORELEASER) ## Download goreleaser locally if necessary.
+$(GORELEASER): $(LOCALBIN)
+	test -s $(LOCALBIN)/goreleaser || GOBIN=$(LOCALBIN) go install github.com/goreleaser/goreleaser/v2@v2.14.1
 
 .PHONY: ko
 ko: $(KO) ## Download ko locally if necessary.
@@ -83,7 +112,7 @@ $(YQ): $(LOCALBIN)
 .PHONY: helm
 helm: $(HELM) ## Download helm locally if necessary.
 $(HELM): $(LOCALBIN)
-	test -s $(LOCALBIN)/helm || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" helm.sh/helm/v3/cmd/helm@v3.9.0
+	test -s $(LOCALBIN)/helm || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" helm.sh/helm/v4/cmd/helm@v4.1.1
 
 .PHONY: ginkgo
 ginkgo: $(GINKGO) ## Download ginkgo locally if necessary.
@@ -93,7 +122,7 @@ $(GINKGO): $(LOCALBIN)
 .PHONY: kind
 kind: $(KIND) ## Download kind locally if necessary.
 $(KIND): $(LOCALBIN)
-	test -s $(LOCALBIN)/kind || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" sigs.k8s.io/kind/cmd/kind@v0.14.0
+	test -s $(LOCALBIN)/kind || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" sigs.k8s.io/kind/cmd/kind@v0.31.0
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
@@ -236,16 +265,29 @@ metallb:
 	kubectl apply -f "https://raw.githubusercontent.com/metallb/metallb/$$(curl "https://api.github.com/repos/metallb/metallb/releases/latest" | jq -r ".tag_name")/config/manifests/metallb-native.yaml"
 	kubectl wait pods -n metallb-system -l app=metallb,component=controller --for=condition=Ready --timeout=10m
 	kubectl wait pods -n metallb-system -l app=metallb,component=speaker --for=condition=Ready --timeout=2m
-	cat hack/metallb.yaml | sed -E "s|172.19|$$(docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' kind | sed -E 's|^([0-9]+\.[0-9]+)\..*$$|\1|g')|g" | kubectl apply -f -
+	@IPV4_PREFIX=$$(docker network inspect kind \
+		-f '{{range .IPAM.Config}}{{println .Subnet " " .Gateway}}{{end}}' \
+		| grep -v ':' \
+		| awk '{print $$2}' \
+		| sed -E 's|^([0-9]+\.[0-9]+)\..*$$|\1|'); \
+	sed -E "s|172\.19|$$IPV4_PREFIX|g" hack/metallb.yaml | kubectl apply -f -
 
 cert-manager:
 	$(HELM) repo add jetstack https://charts.jetstack.io
-	$(HELM) upgrade --install cert-manager jetstack/cert-manager --namespace certmanager-system --create-namespace --set "installCRDs=true"
+	$(HELM) upgrade --install cert-manager jetstack/cert-manager --namespace certmanager-system --create-namespace --set "crds.enabled=true" --version v1.18.3
 
 gateway-api:
-	kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
-# 	Required for the TLSRoutes. Experimentals.
-	kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml
+	kubectl apply \
+		--server-side \
+		--force-conflicts \
+		--field-manager=helm \
+		-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
+	# Required for the TLSRoutes. Experimentals.
+	kubectl apply \
+		--server-side \
+		--force-conflicts \
+		--field-manager=helm \
+		-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml
 	kubectl wait --for=condition=Established crd/gateways.gateway.networking.k8s.io --timeout=60s
 
 envoy-gateway: gateway-api helm ## Install Envoy Gateway for Gateway API tests.
@@ -254,6 +296,28 @@ envoy-gateway: gateway-api helm ## Install Envoy Gateway for Gateway API tests.
 
 load: kind
 	$(KIND) load docker-image --name kamaji ${CONTAINER_REPOSITORY}:${VERSION}
+
+.PHONY: install
+install: helm cert-manager metallb ## Install Kamaji chart from repository using current commit SHA as image tag.
+	$(MAKE) VERSION=$$(git rev-parse --short HEAD) build load
+	$(HELM) repo add clastix https://clastix.github.io/charts
+	$(HELM) repo update
+	$(HELM) upgrade --install kamaji clastix/kamaji \
+		--namespace kamaji-system \
+		--create-namespace \
+		--set 'resources=null' \
+		--set "image.repository=$(CONTAINER_REPOSITORY)" \
+		--set 'image.pullPolicy=Never' \
+		--set "image.tag=$(GIT_HEAD_COMMIT)" \
+		--version 0.0.0+latest
+
+.PHONY: prometheus-install
+prometheus-install: ## Install Prometheus Operator bundle and Kamaji observability manifests.
+	kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+	kubectl -n monitoring create configmap grafana-dashboards --from-file=kamaji-dashboard.json=./config/observability/dashboard/grafana-dashboard-kamaji.json --dry-run=client -o yaml | kubectl apply -f -
+	curl -fsSL https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/v0.89.0/bundle.yaml | sed 's/namespace: default/namespace: monitoring/g' | kubectl apply --server-side --force-conflicts --field-manager=make-prometheus-install -f -
+	kubectl -n monitoring rollout status deploy/prometheus-operator --timeout=3m
+	kubectl apply --server-side --force-conflicts --field-manager=make-prometheus-install -f ./config/observability/
 
 ##@ e2e
 
@@ -278,11 +342,13 @@ e2e: env build load helm ginkgo cert-manager gateway-api envoy-gateway ## Create
 CAPI_URL = https://github.com/clastix/cluster-api-control-plane-provider-kamaji.git
 CAPI_DIR := $(shell mktemp -d)
 CRDS_DIR := $(shell mktemp -d)
+CAPI_VERSION := v0.19.0
 
 .PHONY: apidoc
 apidoc: apidocs-gen
 	@cp charts/kamaji/crds/*.yaml $(CRDS_DIR)
 	@git clone $(CAPI_URL) $(CAPI_DIR)
+	@git -C $(CAPI_DIR) checkout v0.19.0
 	@cp $(CAPI_DIR)/config/crd/bases/*.yaml $(CRDS_DIR)
 	@rm -rf $(CAPI_DIR)
 	$(APIDOCS_GEN) crdoc --resources $(CRDS_DIR) --output docs/content/reference/api.md --template docs/templates/reference-cr.tmpl
