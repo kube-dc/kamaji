@@ -5,6 +5,7 @@ package controlplane
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/blang/semver"
 	appsv1 "k8s.io/api/apps/v1"
@@ -168,13 +169,26 @@ func (k Konnectivity) RemovingVolumes(podSpec *corev1.PodSpec) {
 }
 
 func (k Konnectivity) RemovingKubeAPIServerContainerArg(podSpec *corev1.PodSpec) {
-	if found, index := utilities.HasNamedContainer(podSpec.Containers, apiServerContainerName); found {
-		argsMap := utilities.ArgsFromSliceToMap(podSpec.Containers[index].Args)
-
-		if utilities.ArgsRemoveFlag(argsMap, "--egress-selector-config-file") {
-			podSpec.Containers[index].Args = utilities.ArgsFromMapToSlice(argsMap)
-		}
+	// In-place removal: filter out the --egress-selector-config-file flag
+	// while preserving the order of all other args. Going through
+	// ArgsFromSliceToMap + ArgsFromMapToSlice would alphabetically sort
+	// the entire slice, racing with the main Deployment builder's
+	// mergeAPIServerArgs (sanitizedExtras appended unsorted at end) and
+	// causing each reconcile to flip the args order, churning the
+	// pod-template-hash and the deployment.
+	found, index := utilities.HasNamedContainer(podSpec.Containers, apiServerContainerName)
+	if !found {
+		return
 	}
+	args := podSpec.Containers[index].Args
+	out := args[:0]
+	for _, a := range args {
+		if a == "--egress-selector-config-file" || strings.HasPrefix(a, "--egress-selector-config-file=") {
+			continue
+		}
+		out = append(out, a)
+	}
+	podSpec.Containers[index].Args = out
 }
 
 func (k Konnectivity) RemovingContainer(podSpec *corev1.PodSpec) {
@@ -193,12 +207,30 @@ func (k Konnectivity) buildVolumeMounts(podSpec *corev1.PodSpec) {
 	if !found {
 		return
 	}
-	// Adding the egress selector config file flag
-	args := utilities.ArgsFromSliceToMap(podSpec.Containers[index].Args)
-
-	utilities.ArgsAddFlagValue(args, "--egress-selector-config-file", konnectivityEgressSelectorConfigurationPath)
-
-	podSpec.Containers[index].Args = utilities.ArgsFromMapToSlice(args)
+	// Adding the egress selector config file flag, IF NOT ALREADY PRESENT,
+	// without reordering existing args. Going through ArgsFromSliceToMap +
+	// ArgsFromMapToSlice would alphabetically sort the entire slice,
+	// including user-extras that mergeAPIServerArgs (in deployment.go)
+	// deliberately appends unsorted at the end. The two sort orders
+	// alternate every reconcile, churning the pod-template-hash.
+	args := podSpec.Containers[index].Args
+	desiredVal := konnectivityEgressSelectorConfigurationPath
+	desiredFlag := "--egress-selector-config-file"
+	desiredArg := desiredFlag + "=" + desiredVal
+	flagIdx := -1
+	for i, a := range args {
+		if a == desiredFlag || strings.HasPrefix(a, desiredFlag+"=") {
+			flagIdx = i
+			break
+		}
+	}
+	switch {
+	case flagIdx < 0:
+		args = append(args, desiredArg)
+	case args[flagIdx] != desiredArg:
+		args[flagIdx] = desiredArg
+	}
+	podSpec.Containers[index].Args = args
 
 	vFound, vIndex := false, 0 //nolint:wastedassign
 	// Patching the volume mounts
