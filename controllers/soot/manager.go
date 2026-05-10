@@ -277,7 +277,7 @@ func (m *Manager) retryTenantControlPlaneAnnotations(ctx context.Context, reques
 	})
 }
 
-//nolint:maintidx
+//nolint:maintidx,gocyclo
 func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res reconcile.Result, err error) {
 	// Retrieving the TenantControlPlane:
 	// in case of deletion, we must be sure to properly remove from the memory the soot manager.

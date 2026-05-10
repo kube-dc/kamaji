@@ -221,6 +221,7 @@ func (k Konnectivity) buildVolumeMounts(podSpec *corev1.PodSpec) {
 	for i, a := range args {
 		if a == desiredFlag || strings.HasPrefix(a, desiredFlag+"=") {
 			flagIdx = i
+
 			break
 		}
 	}

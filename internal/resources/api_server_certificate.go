@@ -156,7 +156,7 @@ func (r *APIServerCertificate) mutate(ctx context.Context, tenantControlPlane *k
 
 			dnsNamesMatches, dnsErr := crypto.CheckCertificateNamesAndIPs(r.resource.Data[kubeadmconstants.APIServerCertName], commonNames)
 			if dnsErr != nil {
-				logger.Error(dnsErr, "%s SAN check returned an error", kubeadmconstants.APIServerCertAndKeyBaseName)
+				logger.Error(dnsErr, "SAN check returned an error", "name", kubeadmconstants.APIServerCertAndKeyBaseName)
 			}
 
 			if isCAValid && isCertValid && dnsNamesMatches {
