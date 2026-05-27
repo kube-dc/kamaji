@@ -169,26 +169,28 @@ func (k Konnectivity) RemovingVolumes(podSpec *corev1.PodSpec) {
 }
 
 func (k Konnectivity) RemovingKubeAPIServerContainerArg(podSpec *corev1.PodSpec) {
-	// In-place removal: filter out the --egress-selector-config-file flag
-	// while preserving the order of all other args. Going through
-	// ArgsFromSliceToMap + ArgsFromMapToSlice would alphabetically sort
-	// the entire slice, racing with the main Deployment builder's
-	// mergeAPIServerArgs (sanitizedExtras appended unsorted at end) and
-	// causing each reconcile to flip the args order, churning the
-	// pod-template-hash and the deployment.
+	// In-place removal of --egress-selector-config-file, preserving the order
+	// of all other args. Going through ArgsFromSliceToMap/ArgsFromMapToSlice
+	// alphabetically sorts the whole slice, racing the main Deployment
+	// builder's mergeAPIServerArgs (user extras appended unsorted at the end)
+	// and churning the pod-template-hash every reconcile. Upstream #1160 lands
+	// the same fix our 451e84a originally carried (now deduped to upstream).
 	found, index := utilities.HasNamedContainer(podSpec.Containers, apiServerContainerName)
 	if !found {
 		return
 	}
-	args := podSpec.Containers[index].Args
-	out := args[:0]
-	for _, a := range args {
-		if a == "--egress-selector-config-file" || strings.HasPrefix(a, "--egress-selector-config-file=") {
+	//nolint:prealloc
+	var parsedArgs []string
+
+	for _, v := range podSpec.Containers[index].Args {
+		if strings.HasPrefix(v, "--egress-selector-config-file") || strings.HasPrefix(v, "--egress-selector-config-file=") {
 			continue
 		}
-		out = append(out, a)
+
+		parsedArgs = append(parsedArgs, v)
 	}
-	podSpec.Containers[index].Args = out
+
+	podSpec.Containers[index].Args = parsedArgs
 }
 
 func (k Konnectivity) RemovingContainer(podSpec *corev1.PodSpec) {
@@ -207,31 +209,29 @@ func (k Konnectivity) buildVolumeMounts(podSpec *corev1.PodSpec) {
 	if !found {
 		return
 	}
-	// Adding the egress selector config file flag, IF NOT ALREADY PRESENT,
-	// without reordering existing args. Going through ArgsFromSliceToMap +
-	// ArgsFromMapToSlice would alphabetically sort the entire slice,
-	// including user-extras that mergeAPIServerArgs (in deployment.go)
-	// deliberately appends unsorted at the end. The two sort orders
-	// alternate every reconcile, churning the pod-template-hash.
-	args := podSpec.Containers[index].Args
-	desiredVal := konnectivityEgressSelectorConfigurationPath
-	desiredFlag := "--egress-selector-config-file"
-	desiredArg := desiredFlag + "=" + desiredVal
-	flagIdx := -1
-	for i, a := range args {
-		if a == desiredFlag || strings.HasPrefix(a, desiredFlag+"=") {
-			flagIdx = i
+	// Adding the egress selector config file flag without reordering existing
+	// args (maps don't preserve order; the api-server has order-sensitive
+	// params and user extras are appended unsorted by mergeAPIServerArgs).
+	// Upstream #1160 == our original 451e84a churn fix.
+	egressConfigFlag := fmt.Sprintf("--egress-selector-config-file=%s", konnectivityEgressSelectorConfigurationPath)
 
-			break
+	var foundFlag bool
+
+	for i, v := range podSpec.Containers[index].Args {
+		if !strings.HasPrefix(v, "--egress-selector-config-file") {
+			continue
 		}
+
+		if v != egressConfigFlag {
+			podSpec.Containers[index].Args[i] = egressConfigFlag
+		}
+
+		foundFlag = true
 	}
-	switch {
-	case flagIdx < 0:
-		args = append(args, desiredArg)
-	case args[flagIdx] != desiredArg:
-		args[flagIdx] = desiredArg
+
+	if !foundFlag {
+		podSpec.Containers[index].Args = append(podSpec.Containers[index].Args, egressConfigFlag)
 	}
-	podSpec.Containers[index].Args = args
 
 	vFound, vIndex := false, 0 //nolint:wastedassign
 	// Patching the volume mounts
