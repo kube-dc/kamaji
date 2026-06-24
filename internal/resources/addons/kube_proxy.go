@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 
+	jsonpatchv5 "github.com/evanphx/json-patch/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/yaml"
 
 	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
 	"github.com/clastix/kamaji/internal/constants"
@@ -27,6 +29,10 @@ import (
 	"github.com/clastix/kamaji/internal/resources/utils"
 	"github.com/clastix/kamaji/internal/utilities"
 )
+
+// kubeProxyConfigConfKey is the key in the kube-proxy ConfigMap that holds the
+// KubeProxyConfiguration YAML payload (kubeadm-managed).
+const kubeProxyConfigConfKey = "config.conf"
 
 type KubeProxy struct {
 	Client client.Client
@@ -147,6 +153,14 @@ func (k *KubeProxy) CreateOrUpdate(ctx context.Context, tcp *kamajiv1alpha1.Tena
 		return controllerutil.OperationResultNone, err
 	}
 
+	if err = k.applyConfigJSONPatches(tcp.Spec.Addons.KubeProxy.ConfigurationJSONPatches); err != nil {
+		logger.Error(err, "kube-proxy config.conf JSON patching failed")
+
+		return controllerutil.OperationResultNone, err
+	}
+
+	k.stampConfigChecksumOnDaemonSet()
+
 	var operationResult controllerutil.OperationResult
 
 	reconciliationResult := controllerutil.OperationResultNone
@@ -158,18 +172,25 @@ func (k *KubeProxy) CreateOrUpdate(ctx context.Context, tcp *kamajiv1alpha1.Tena
 		return controllerutil.OperationResultNone, err
 	}
 	reconciliationResult = utils.UpdateOperationResult(reconciliationResult, operationResult)
-	// DaemonSet
-	operationResult, err = k.mutateDaemonSet(ctx, tenantClient)
+	// ConfigMap MUST be persisted before the DaemonSet: mutateDaemonSet
+	// carries the kamaji.clastix.io/checksum pod-template annotation
+	// (stampConfigChecksumOnDaemonSet), and once that lands the DaemonSet
+	// controller rolls kube-proxy pods. If the DaemonSet went first, a new
+	// pod could start and mount the OLD config.conf while already carrying
+	// the NEW pod-template hash; the subsequent ConfigMap update would then
+	// not re-roll it (hash unchanged), leaving that node on stale config.
+	// Writing the ConfigMap first closes that window.
+	operationResult, err = k.mutateConfigMap(ctx, tenantClient)
 	if err != nil {
-		logger.Error(err, "DaemonSet reconciliation failed")
+		logger.Error(err, "ConfigMap reconciliation failed")
 
 		return controllerutil.OperationResultNone, err
 	}
 	reconciliationResult = utils.UpdateOperationResult(reconciliationResult, operationResult)
-	// ConfigMap
-	operationResult, err = k.mutateConfigMap(ctx, tenantClient)
+	// DaemonSet (after ConfigMap — see ordering note above)
+	operationResult, err = k.mutateDaemonSet(ctx, tenantClient)
 	if err != nil {
-		logger.Error(err, "ConfigMap reconciliation failed")
+		logger.Error(err, "DaemonSet reconciliation failed")
 
 		return controllerutil.OperationResultNone, err
 	}
@@ -316,6 +337,67 @@ func (k *KubeProxy) mutateDaemonSet(ctx context.Context, tenantClient client.Cli
 	}
 	//nolint:staticcheck
 	return controllerutil.OperationResultNone, tenantClient.Patch(ctx, k.daemonSet, client.Apply, client.FieldOwner("kamaji"), client.ForceOwnership)
+}
+
+// applyConfigJSONPatches applies the RFC-6902 JSON patches from
+// `tcp.Spec.Addons.KubeProxy.ConfigurationJSONPatches` to the kube-proxy
+// KubeProxyConfiguration YAML in `k.configMap.Data["config.conf"]`. The YAML
+// is converted to JSON for patching and back to YAML before being written, so
+// the kubelet/kube-proxy still see canonical YAML. Idempotent if patches is empty.
+func (k *KubeProxy) applyConfigJSONPatches(patches kamajiv1alpha1.JSONPatches) error {
+	if len(patches) == 0 {
+		return nil
+	}
+
+	rawYAML, ok := k.configMap.Data[kubeProxyConfigConfKey]
+	if !ok {
+		return fmt.Errorf("kube-proxy ConfigMap has no %q key to patch", kubeProxyConfigConfKey)
+	}
+
+	asJSON, err := yaml.YAMLToJSON([]byte(rawYAML))
+	if err != nil {
+		return fmt.Errorf("converting %s YAML to JSON: %w", kubeProxyConfigConfKey, err)
+	}
+
+	patchBytes, err := patches.ToJSON()
+	if err != nil {
+		return fmt.Errorf("encoding kube-proxy JSON patches: %w", err)
+	}
+
+	patch, err := jsonpatchv5.DecodePatch(patchBytes)
+	if err != nil {
+		return fmt.Errorf("decoding kube-proxy JSON patches: %w", err)
+	}
+
+	patched, err := patch.Apply(asJSON)
+	if err != nil {
+		return fmt.Errorf("applying kube-proxy JSON patches to %s: %w", kubeProxyConfigConfKey, err)
+	}
+
+	patchedYAML, err := yaml.JSONToYAML(patched)
+	if err != nil {
+		return fmt.Errorf("converting patched %s back to YAML: %w", kubeProxyConfigConfKey, err)
+	}
+
+	k.configMap.Data[kubeProxyConfigConfKey] = string(patchedYAML)
+
+	return nil
+}
+
+// stampConfigChecksumOnDaemonSet computes a sorted-map checksum of the kube-proxy
+// ConfigMap data and stamps it on the DaemonSet pod-template annotations under
+// the standard `kamaji.clastix.io/checksum` key. This guarantees that any change
+// to `config.conf` (including JSON-patch additions/removals) bumps the pod-template
+// hash, forcing the kubelet on every worker to roll the kube-proxy pod and
+// pick up the new configuration.
+func (k *KubeProxy) stampConfigChecksumOnDaemonSet() {
+	checksum := utilities.CalculateMapChecksum(k.configMap.Data)
+
+	if k.daemonSet.Spec.Template.Annotations == nil {
+		k.daemonSet.Spec.Template.Annotations = map[string]string{}
+	}
+
+	k.daemonSet.Spec.Template.Annotations[constants.Checksum] = checksum
 }
 
 func (k *KubeProxy) decodeManifests(ctx context.Context, tcp *kamajiv1alpha1.TenantControlPlane) error {

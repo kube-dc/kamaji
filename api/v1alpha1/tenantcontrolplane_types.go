@@ -325,6 +325,22 @@ type AddonSpec struct {
 	ImageOverrideTrait `json:",inline"`
 }
 
+// KubeProxyAddonSpec is the spec for the kube-proxy addon. It embeds AddonSpec
+// (image overrides shared with CoreDNS) and adds RFC-6902 JSON patches that are
+// applied to the kube-proxy KubeProxyConfiguration (`config.conf` in the
+// `kube-system/kube-proxy` ConfigMap) before it is written to the tenant cluster.
+// A SHA-checksum of the resulting config is stamped on the kube-proxy DaemonSet
+// pod-template so that patch changes trigger a rollout automatically.
+type KubeProxyAddonSpec struct {
+	AddonSpec `json:",inline"`
+	// ConfigurationJSONPatches contains the RFC 6902 JSON patches applied to the
+	// kube-proxy `config.conf` configuration before it is uploaded to the tenant.
+	// Useful for enabling externally-scrapeable metrics
+	// (`[{"op":"add","path":"/metricsBindAddress","value":"0.0.0.0:10249"}]`) or
+	// changing the proxy mode.
+	ConfigurationJSONPatches JSONPatches `json:"configurationJSONPatches,omitempty"`
+}
+
 type ImageOverrideTrait struct {
 	// ImageRepository sets the container registry to pull images from.
 	// if not set, the default ImageRepository will be used instead.
@@ -412,7 +428,8 @@ type AddonsSpec struct {
 	Konnectivity *KonnectivitySpec `json:"konnectivity,omitempty"`
 	// Enables the kube-proxy addon in the Tenant Cluster.
 	// The registry and the tag are configurable, the image is hard-coded to `kube-proxy`.
-	KubeProxy *AddonSpec `json:"kubeProxy,omitempty"`
+	// configurationJSONPatches lets you customise the kube-proxy `config.conf` payload.
+	KubeProxy *KubeProxyAddonSpec `json:"kubeProxy,omitempty"`
 }
 
 type Permissions struct {

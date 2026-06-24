@@ -276,7 +276,41 @@ versions:
                     description: |-
                       Enables the kube-proxy addon in the Tenant Cluster.
                       The registry and the tag are configurable, the image is hard-coded to `kube-proxy`.
+                      configurationJSONPatches lets you customise the kube-proxy `config.conf` payload.
                     properties:
+                      configurationJSONPatches:
+                        description: |-
+                          ConfigurationJSONPatches contains the RFC 6902 JSON patches applied to the
+                          kube-proxy `config.conf` configuration before it is uploaded to the tenant.
+                          Useful for enabling externally-scrapeable metrics
+                          (`[{"op":"add","path":"/metricsBindAddress","value":"0.0.0.0:10249"}]`) or
+                          changing the proxy mode.
+                        items:
+                          properties:
+                            from:
+                              description: From specifies the source location for move or copy operations.
+                              type: string
+                            op:
+                              description: Op is the RFC 6902 JSON Patch operation.
+                              enum:
+                                - add
+                                - remove
+                                - replace
+                                - move
+                                - copy
+                                - test
+                              type: string
+                            path:
+                              description: Path specifies the target location in the JSON document. Use "/" to separate keys; "-" for appending to arrays.
+                              type: string
+                            value:
+                              description: Value is the operation value to be used when Op is add, replace, test.
+                              x-kubernetes-preserve-unknown-fields: true
+                          required:
+                            - op
+                            - path
+                          type: object
+                        type: array
                       imageRepository:
                         description: |-
                           ImageRepository sets the container registry to pull images from.
