@@ -5,6 +5,7 @@ package kubeadm
 
 import (
 	"bytes"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -72,4 +73,38 @@ func IsKubeconfigValid(bytes []byte, expirationThreshold time.Duration) bool {
 	ok, _ := crypto.IsValidCertificateKeyPairBytes(kc.AuthInfos[0].AuthInfo.ClientCertificateData, kc.AuthInfos[0].AuthInfo.ClientKeyData, expirationThreshold)
 
 	return ok
+}
+
+// IsKubeconfigServerMatching reports whether every cluster server in the
+// kubeconfig points at the expected host:port endpoint.
+//
+// kamaji binds the control-plane endpoint into the kubeconfig at generation
+// time and the checksum-based regeneration path can miss a later endpoint
+// change (e.g. a public-hostname endpoint replaced by the LB IP), leaving a
+// STALE server URL that silently breaks mgmt-side consumers — notably the CAPI
+// control-plane provider, whose per-cluster kubeconfig is copied from this one.
+// This lets the kubeconfig reconciler force a regenerate when the server drifts.
+//
+// It is conservative against churn: when it cannot determine the expected
+// endpoint or parse the data, it returns true (treat as matching) so it never
+// forces an unnecessary regeneration — the CA/expiry/checksum checks still own
+// those cases.
+func IsKubeconfigServerMatching(in []byte, expectedEndpoint string) bool {
+	if expectedEndpoint == "" || len(in) == 0 {
+		return true
+	}
+
+	kc, err := utilities.DecodeKubeconfigYAML(in)
+	if err != nil || len(kc.Clusters) == 0 {
+		return true
+	}
+
+	for _, cluster := range kc.Clusters {
+		u, uErr := url.Parse(cluster.Cluster.Server)
+		if uErr != nil || u.Host != expectedEndpoint {
+			return false
+		}
+	}
+
+	return true
 }

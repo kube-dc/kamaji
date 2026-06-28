@@ -194,6 +194,17 @@ func (r *KubeconfigResource) mutate(ctx context.Context, tenantControlPlane *kam
 		shouldCreate = shouldCreate || !kubeadm.IsKubeconfigCAValid(r.resource.Data[r.KubeConfigFileName], caCertificatesSecret.Data[kubeadmconstants.CACertName])
 		shouldCreate = shouldCreate || !kubeadm.IsKubeconfigValid(r.resource.Data[r.KubeConfigFileName], r.CertExpirationThreshold) // invalid kubeconfig, or expired client certificate
 		shouldCreate = shouldCreate || status.Checksum != checksum || len(r.resource.UID) == 0                                      // Wrong checksum
+		// The external admin kubeconfig server drifted from the current
+		// control-plane endpoint. Only admin/super-admin use the external
+		// ControlPlaneEndpoint here (it is overridden to the in-cluster .svc
+		// for the .svc variant below, and controller-manager/scheduler use
+		// localhost via customizeConfig), so the check is scoped to "admin".
+		// Without this, an endpoint change (e.g. public-hostname -> LB) leaves
+		// a stale server that the checksum path can miss, silently breaking
+		// mgmt-side consumers like the CAPI control-plane provider.
+		if strings.Contains(r.KubeConfigFileName, "admin") {
+			shouldCreate = shouldCreate || !kubeadm.IsKubeconfigServerMatching(r.resource.Data[r.KubeConfigFileName], config.InitConfiguration.ControlPlaneEndpoint)
+		}
 
 		shouldRotate := utilities.IsRotationRequested(r.resource)
 
