@@ -87,9 +87,18 @@ func NewConnectionConfig(ctx context.Context, client client.Client, ds kamajiv1a
 		password = string(p)
 	}
 
-	eps := make([]ConnectionEndpoint, 0, len(ds.Spec.Endpoints))
+	// The controller's own connections (setup, cleanup, migration, health)
+	// prefer the management endpoints when set: control planes may reach the
+	// datastore over a network path the controller cannot use (and vice versa).
+	// Rendered control-plane args are built elsewhere and keep using Endpoints.
+	specEndpoints := ds.Spec.Endpoints
+	if len(ds.Spec.ManagementEndpoints) > 0 {
+		specEndpoints = ds.Spec.ManagementEndpoints
+	}
 
-	for _, ep := range ds.Spec.Endpoints {
+	eps := make([]ConnectionEndpoint, 0, len(specEndpoints))
+
+	for _, ep := range specEndpoints {
 		host, stringPort, err := net.SplitHostPort(ep)
 		if err != nil {
 			return nil, fmt.Errorf("cannot retrieve host-port pair from DataStore endpoints: %w", err)

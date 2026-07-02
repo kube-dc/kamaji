@@ -624,6 +624,11 @@ func (in *DataStoreSpec) DeepCopyInto(out *DataStoreSpec) {
 		*out = make(Endpoints, len(*in))
 		copy(*out, *in)
 	}
+	if in.ManagementEndpoints != nil {
+		in, out := &in.ManagementEndpoints, &out.ManagementEndpoints
+		*out = make(Endpoints, len(*in))
+		copy(*out, *in)
+	}
 	if in.BasicAuth != nil {
 		in, out := &in.BasicAuth, &out.BasicAuth
 		*out = new(BasicAuth)

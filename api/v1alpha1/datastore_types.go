@@ -39,6 +39,17 @@ type DataStoreSpec struct {
 	// List of the endpoints to connect to the shared datastore.
 	// No need for protocol, just bare IP/FQDN and port.
 	Endpoints Endpoints `json:"endpoints"`
+	// List of the endpoints the Kamaji controller itself uses for datastore
+	// management operations (schema/user setup, cleanup on TenantControlPlane
+	// deletion, migration, health checks). Rendered control planes keep using
+	// Endpoints for their own connections (e.g. kube-apiserver --etcd-servers).
+	// Set this when the control planes and the Kamaji controller reach the
+	// datastore over different network paths (e.g. the datastore is only
+	// pod-network-reachable from the tenant side, while the controller must go
+	// through a load balancer). When empty, Endpoints is used.
+	// No need for protocol, just bare IP/FQDN and port.
+	// +optional
+	ManagementEndpoints Endpoints `json:"managementEndpoints,omitempty"`
 	// In case of authentication enabled for the given data store, specifies the username and password pair.
 	// This value is optional.
 	BasicAuth *BasicAuth `json:"basicAuth,omitempty"`

@@ -126,6 +126,21 @@ versions:
                   type: string
                 minItems: 1
                 type: array
+              managementEndpoints:
+                description: |-
+                  List of the endpoints the Kamaji controller itself uses for datastore
+                  management operations (schema/user setup, cleanup on TenantControlPlane
+                  deletion, migration, health checks). Rendered control planes keep using
+                  Endpoints for their own connections (e.g. kube-apiserver --etcd-servers).
+                  Set this when the control planes and the Kamaji controller reach the
+                  datastore over different network paths (e.g. the datastore is only
+                  pod-network-reachable from the tenant side, while the controller must go
+                  through a load balancer). When empty, Endpoints is used.
+                  No need for protocol, just bare IP/FQDN and port.
+                items:
+                  type: string
+                minItems: 1
+                type: array
               tlsConfig:
                 description: |-
                   Defines the TLS/SSL configuration required to connect to the data store in a secure way.
