@@ -173,7 +173,6 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
-
 	dsConnection, err := datastore.NewStorageConnection(ctx, r.Client, *ds)
 	if err != nil {
 		log.Error(err, "cannot generate the DataStore connection for the given instance")
@@ -181,6 +180,20 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 	defer dsConnection.Close()
+	// DataStore Ready may be stale across an endpoint transition. Prove that
+	// this exact management route is usable before acknowledging its
+	// fingerprint; k8-manager keeps the compatibility alias until every live
+	// TCP has published this applied-state proof.
+	if err := dsConnection.Check(ctx); err != nil {
+		log.Error(err, "selected DataStore route is not reachable")
+
+		return ctrl.Result{}, err
+	}
+	if changed, observeErr := r.observeKubeDCDataStoreEndpoint(ctx, tenantControlPlane, ds); observeErr != nil {
+		return ctrl.Result{}, observeErr
+	} else if changed {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
 
 	dso, err := r.dataStoreOverride(ctx, tenantControlPlane)
 	if err != nil {

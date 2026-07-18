@@ -12,6 +12,12 @@ image:
   # -- Overrides the image tag whose default is the chart appVersion.
   tag:
 
+# Kube-DC capability handshake. Keep false unless the deployed controller image
+# includes the per-TenantControlPlane tenant-client endpoint annotation. The
+# k8-manager refuses to retire a control-plane -ext alias without this object.
+tenantClientClusterIPCapability:
+  enabled: false
+
 # -- A list of extra arguments to add to the kamaji controller default ones
 extraArgs: []
 

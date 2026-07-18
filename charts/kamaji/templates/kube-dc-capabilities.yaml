@@ -1,0 +1,11 @@
+{{- if .Values.tenantClientClusterIPCapability.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kamaji-capabilities
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kamaji.labels" . | nindent 4 }}
+data:
+  tenantClientClusterIP: "true"
+{{- end }}

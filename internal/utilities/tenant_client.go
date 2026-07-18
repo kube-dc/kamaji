@@ -5,10 +5,14 @@ package utilities
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
@@ -59,22 +63,21 @@ func GetRESTClientConfig(ctx context.Context, client client.Client, tenantContro
 		return nil, err
 	}
 
-	// Use Service DNS by default for in-cluster access
-	host := fmt.Sprintf("https://%s.%s.svc:%d", tenantControlPlane.GetName(), tenantControlPlane.GetNamespace(), tenantControlPlane.Spec.NetworkProfile.Port)
+	// Resolve the route after reading the kubeconfig. An explicit selection is
+	// authoritative; for legacy, unannotated TCPs we also tolerate an already
+	// retired -ext Service by falling back to the upstream ClusterIP name. This
+	// is required to upgrade clusters that completed the old namespace-wide
+	// retirement before per-Service transition tokens existed.
+	host, err := tenantClientHost(ctx, client, tenantControlPlane)
+	if err != nil {
+		return nil, err
+	}
 	// ServerName for TLS verification (always uses the original service name)
 	serverName := fmt.Sprintf("%s.%s.svc.cluster.local", tenantControlPlane.GetName(), tenantControlPlane.GetNamespace())
 
 	// Use external endpoint service (-ext) if LoadBalancer is assigned
 	// This enables cross-VPC deployments where controller cannot reach Service ClusterIP
 	// kube-dc automatically creates <service>-ext endpoints for LoadBalancer services
-	if tenantControlPlane.Status.ControlPlaneEndpoint != "" {
-		host = fmt.Sprintf("https://%s-ext.%s.svc.cluster.local:%d",
-			tenantControlPlane.GetName(),
-			tenantControlPlane.GetNamespace(),
-			tenantControlPlane.Spec.NetworkProfile.Port)
-		// Keep ServerName as the original service for TLS certificate validation
-		// The certificate is issued for the original service name, not the -ext endpoint
-	}
 
 	config := &restclient.Config{
 		Host: host,
@@ -88,4 +91,75 @@ func GetRESTClientConfig(ctx context.Context, client client.Client, tenantContro
 	}
 
 	return config, nil
+}
+
+const (
+	TenantClientEndpointAnnotation         = "network.kube-dc.com/tenant-client-endpoint"
+	TenantClientEndpointClusterIP          = "cluster-ip"
+	TenantClientEndpointObservedAnnotation = "network.kube-dc.com/tenant-client-endpoint-observed"
+	DataStoreEndpointObservedAnnotation    = "network.kube-dc.com/datastore-endpoint-observed"
+	EndpointModeDirect                     = "direct"
+	TenantClientEndpointTokenAnnotation    = "network.kube-dc.com/tenant-client-endpoint-token"
+	EndpointModeExternal                   = "external"
+)
+
+func tenantClientHost(
+	ctx context.Context,
+	cli client.Client,
+	tenantControlPlane *kamajiv1alpha1.TenantControlPlane,
+) (string, error) {
+	// Upstream/default path: the stable Service name. Dual-homed control-plane
+	// pods put this ClusterIP on the default VPC, so the Kamaji controller can
+	// route to it directly.
+	host := fmt.Sprintf("https://%s.%s.svc:%d",
+		tenantControlPlane.GetName(),
+		tenantControlPlane.GetNamespace(),
+		tenantControlPlane.Spec.NetworkProfile.Port)
+
+	// No LoadBalancer or an explicit direct selection uses the upstream name.
+	if tenantControlPlane.Status.ControlPlaneEndpoint == "" ||
+		TenantClientEndpointSelection(tenantControlPlane) == TenantClientEndpointClusterIP {
+		return host, nil
+	}
+
+	// Legacy kube-dc path. Before per-Service transition tokens, stage retired
+	// -ext namespace-wide. On upgrade those TCPs are necessarily unannotated.
+	// Preserve the legacy route whenever its Service still exists, but if it is
+	// definitively absent use the upstream ClusterIP so a Kamaji restart cannot
+	// strand an already-migrated TCP. API read failures remain fail-closed: they
+	// are not evidence that the compatibility endpoint is gone.
+	extName := tenantControlPlane.GetName() + "-ext"
+	ext := &corev1.Service{}
+	if err := cli.Get(ctx, k8stypes.NamespacedName{
+		Namespace: tenantControlPlane.GetNamespace(),
+		Name:      extName,
+	}, ext); err != nil {
+		if apierrors.IsNotFound(err) {
+			return host, nil
+		}
+		return "", fmt.Errorf("read legacy tenant API Service %s/%s: %w",
+			tenantControlPlane.GetNamespace(), extName, err)
+	}
+
+	return fmt.Sprintf("https://%s.%s.svc.cluster.local:%d",
+		extName,
+		tenantControlPlane.GetNamespace(),
+		tenantControlPlane.Spec.NetworkProfile.Port), nil
+}
+
+func TenantClientEndpointSelection(tenantControlPlane *kamajiv1alpha1.TenantControlPlane) string {
+	if tenantControlPlane.GetAnnotations()[TenantClientEndpointAnnotation] == TenantClientEndpointClusterIP {
+		return TenantClientEndpointClusterIP
+	}
+	return EndpointModeExternal
+}
+
+func DataStoreEndpointFingerprint(dataStore *kamajiv1alpha1.DataStore) string {
+	endpoints := append([]string(nil), dataStore.Spec.Endpoints...)
+	management := append([]string(nil), dataStore.Spec.ManagementEndpoints...)
+	sort.Strings(endpoints)
+	sort.Strings(management)
+	canonical := strings.Join(endpoints, "\x00") + "\x01" + strings.Join(management, "\x00")
+	sum := sha256.Sum256([]byte(canonical))
+	return fmt.Sprintf("%x", sum[:])
 }
