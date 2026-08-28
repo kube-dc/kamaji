@@ -220,6 +220,13 @@ func (r *Agent) mutate(ctx context.Context, tenantControlPlane *kamajiv1alpha1.T
 		podTemplateSpec.Spec.PriorityClassName = "system-cluster-critical"
 		podTemplateSpec.Spec.Tolerations = tenantControlPlane.Spec.Addons.Konnectivity.KonnectivityAgentSpec.Tolerations
 		podTemplateSpec.Spec.HostNetwork = tenantControlPlane.Spec.Addons.Konnectivity.KonnectivityAgentSpec.HostNetwork
+		if podTemplateSpec.Spec.HostNetwork {
+			// Host-network agents must keep resolving cluster names the same
+			// way pod-network agents do: without this, Kubernetes silently
+			// downgrades ClusterFirst to Default and an FQDN proxy-server-host
+			// stops resolving (kube-dc codex review 2026-08-28).
+			podTemplateSpec.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+		}
 		podTemplateSpec.Spec.NodeSelector = map[string]string{
 			"kubernetes.io/os": "linux",
 		}
@@ -260,6 +267,13 @@ func (r *Agent) mutate(ctx context.Context, tenantControlPlane *kamajiv1alpha1.T
 		args["--proxy-server-port"] = fmt.Sprintf("%d", tenantControlPlane.Spec.Addons.Konnectivity.KonnectivityServerSpec.Port)
 		args["--admin-server-port"] = "8133"
 		args["--health-server-port"] = "8134"
+		if tenantControlPlane.Spec.Addons.Konnectivity.KonnectivityAgentSpec.HostNetwork {
+			// On the host network an empty bind address exposes the
+			// unauthenticated health listener (healthz/metrics) on EVERY node
+			// interface, public NICs included. Bind loopback and point the
+			// probes at 127.0.0.1 (kube-dc codex review 2026-08-28).
+			args["--health-server-host"] = "127.0.0.1"
+		}
 		args["--service-account-token-path"] = "/var/run/secrets/tokens/konnectivity-agent-token"
 
 		extraArgs := utilities.ArgsFromSliceToMap(tenantControlPlane.Spec.Addons.Konnectivity.KonnectivityAgentSpec.ExtraArgs)
@@ -275,16 +289,40 @@ func (r *Agent) mutate(ctx context.Context, tenantControlPlane *kamajiv1alpha1.T
 				Name:      agentTokenName,
 			},
 		}
+		probeHost := ""
+		if tenantControlPlane.Spec.Addons.Konnectivity.KonnectivityAgentSpec.HostNetwork {
+			probeHost = "127.0.0.1" // health listener is loopback-bound on host network
+		}
 		podTemplateSpec.Spec.Containers[0].LivenessProbe = &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/healthz",
+					Host:   probeHost,
 					Port:   intstr.FromInt32(8134),
 					Scheme: corev1.URISchemeHTTP,
 				},
 			},
 			InitialDelaySeconds: 15,
 			TimeoutSeconds:      15,
+			PeriodSeconds:       10,
+			SuccessThreshold:    1,
+			FailureThreshold:    3,
+		}
+		// Readiness gates on /readyz (server connection established) —
+		// /healthz answers 200 unconditionally, so without this an agent
+		// that cannot reach any proxy server still counted as Ready and a
+		// rollout could retire the only working pod (codex review 2026-08-28).
+		podTemplateSpec.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/readyz",
+					Host:   probeHost,
+					Port:   intstr.FromInt32(8134),
+					Scheme: corev1.URISchemeHTTP,
+				},
+			},
+			InitialDelaySeconds: 5,
+			TimeoutSeconds:      10,
 			PeriodSeconds:       10,
 			SuccessThreshold:    1,
 			FailureThreshold:    3,
