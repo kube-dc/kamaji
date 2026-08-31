@@ -349,3 +349,20 @@ table: `kube-dc/docs/internal/upstream-vs-fork-strategy.md`.
 Rollback: `KAMAJI_VERSION=1.0.8-kube-dc`, `KAMAJI_IMAGE_TAG=edge-26.5.2-v12-kube-dc`.
 Next hops (cs/zrh, then cloud) and the provider v3 / shared-manifest change each
 need a separate approval after ≥24 h on stage.
+
+## Merge #2 — cs/zrh canary (2026-08-31 14:18 UTC): GREEN
+
+Operator-directed hop ~1 h after stage (Codex conditional GO, round 5). Fleet
+`6d3c9ab`. Startup gate clean (378 s, 0 restarts, TLSRoute INFO line); all 9
+existing TCPs (incl. customer clusters) re-rendered exactly once and converged;
+kubeconfig checksums changed once each; datastores 11/11 Ready; a customer
+created a new cluster mid-window successfully. Full tenant E2E on a throwaway
+cs-tsap cluster: CP Ready 3 min, worker join, konnectivity logs/exec, DNS
+int+ext, kube-proxy ClusterIP + the fork's configurationJSONPatches applied,
+port-forward 60/60 over 10 min, CSI PVC persistence across pod recreate AND
+worker replacement, teardown 43 s. LoadBalancer untestable: account static
+pool exhausted (CCM refuses dynamic IPs by design). Two pre-existing platform
+findings recorded in `upstream-vs-fork-strategy.md`: fresh-CP VPA bootstrap
+OOM (control-proven on v13), and the single-worker drain deadlock on the CSI
+VolumeAttachment finalizer. Remaining: cloud (remove its TEMPORARY provider
+freeze in a window), provider v3 + shared manifest, pins, upstream PRs.
