@@ -263,3 +263,39 @@ CAPI v1beta2) is a separate migration and was not taken.** Next image tag:
 
 Image `edge-26.8.5-v1-kube-dc` (counter restarts per upstream tag), chart
 `1.0.10-kube-dc`. Roll out stage -> cs/zrh -> cloud as in Merge #1 §5.
+
+## Merge #2 — independent review and follow-up fixes (2026-08-31)
+
+Codex (gpt-5.6-sol, xhigh) reviewed the merged tree against BOTH parents.
+Round 1: every conflict resolution confirmed correct; verdict FIX on four
+implementation items. Round 2 after the fixes: **SHIP to STAGE** (explicitly
+not production approval). Raw reviews and the per-finding triage:
+`kube-dc/docs/internal/kamaji-merge-26.8.5-codex-review.md` and
+`upstream-vs-fork-strategy.md` (Implementation log).
+
+Fix commits on this branch: `3ab42a8` (soot: pause gate = `spec.replicas == 0`
+only — the old `availableReplicas` predicate collided with upstream #1193's
+new scheduler/CM readiness probes; 30s wake-up requeue while paused;
+goroutine-local `startErr` instead of Reconcile's named `err`; lifecycle
+cases before client-identity cases in the running-manager switch;
+DataStore fingerprint compared before the live `Check`; dead
+`EndpointModeDirect` removed) and the watchdog comment correction.
+Provider: `56c8aa9` aligns its k8s.io replace block with kamaji's (the
+inherited v0.19.0 block had pinned apiserver/kubelet/kube-proxy to v0.35.0).
+
+Gate dispositions that changed:
+- Pre-render DataStore acknowledgement (round-1 CRITICAL): NOT a merge
+  blocker — no deployed k8-manager reads the observation annotations (only
+  the unmerged `codex/dual-home-productize` branch does). It is a HARD
+  PRE-ACTIVATION GATE for that consumer: acknowledgements must be
+  audience-specific and prove the intended rendered generation rolled out.
+- Watchdog robustness (persist failure state before cancel, jittered probes,
+  429/throttling not counted as unreachability): STAGE-EXIT gate before
+  production.
+- Konnectivity `/readyz` on the shipped agent image: unchanged stage gate.
+
+Stage acceptance list = the MUST-VERIFY rows of the round-1 review
+(endpoint/certificate state machine; pause→resume 1→0→1 with TCP untouched
+and scheduler/CM-only unreadiness NOT tearing soot down; DataStore route and
+rotation fan-out; admin kubeconfig drift incl. IPv6; rendered control plane
+and addons on 1.34/1.35 tenants; chart capability handshake).

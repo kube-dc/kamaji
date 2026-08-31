@@ -89,9 +89,10 @@ func (m *Manager) retrieveTenantControlPlane(ctx context.Context, request reconc
 // If the TenantControlPlane is deleted we have to free up memory by stopping the soot manager:
 // this is made possible by retrieving the cancel function of the soot manager context to cancel it.
 // watchdogProbeInterval is how often the per-TCP watchdog probes the
-// tenant API. 30s matches Kamaji's default reconcile cadence for
-// healthy clusters and is well below the 10s controller-runtime
-// timeout, so a healthy cluster stays unaffected.
+// tenant API. 30s matches Kamaji's default reconcile cadence for healthy
+// clusters. Each probe is a single /version request with its own 5s client
+// timeout (see tenantHealthWatchdog), so a probe can never outlast the
+// interval and a healthy cluster stays unaffected.
 const watchdogProbeInterval = 30 * time.Second
 
 // watchdogMaxFailures is the number of consecutive probe failures
