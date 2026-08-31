@@ -188,3 +188,78 @@ combine both sides.)
   Our v1.35-field-stripping logic remains intact at the same insertion
   point; verify with the merged `kubelet config` test that's still
   passing locally.
+
+---
+
+# Merge #2 — clastix/kamaji `26.8.5-edge` (2026-08-31)
+
+> **Status**: merged, built-locally-verified, on test branch
+> `kube-dc-merge-26.8.5-edge` (from deployed tip `0ea073e`, chart
+> 1.0.9-kube-dc / image edge-26.5.2-v13-kube-dc). NOT yet promoted,
+> NOT yet built or released. Snapshot tag: `pre-upstream-merge-snapshot-20260831`.
+> Full ledger and validation matrix: `kube-dc/docs/internal/upstream-vs-fork-strategy.md`.
+
+## What's in the merge
+
+- 69 upstream commits since merge-base `1ed13ce` (26.5.2-edge-3), notably:
+  `fix: rework the trigger channels around how source.Channel consumes them (#1259)`,
+  `fix(soot): restarting manager when cert rotates (#1191)`,
+  `feat: configurable securityContext for containers and pod (#1181)`,
+  `fix(deployment): render readiness probe for scheduler and controller-manager (#1193)`,
+  `feat: dual stack support for pod and service cidrs (#1176)`,
+  `fix(sec): escaping datastore user and schema in sql statements (#1239)`,
+  `feat(datastore): triggering tcp reconciliation upon secret changes (#1161)`,
+  `fix(kubeadm): call AllowAPIServerToAccessKubeletAPI ... v1.36.1 (#1172)`.
+- Four of our commits were BACKPORTS of upstream PRs and are absorbed by the
+  merge itself: #1152, #1160, #1165, #1172. Our `451e84a` (konnectivity
+  args order) was already deduped to #1160 before this merge.
+- Upstream tag chosen over `upstream/master` (5 commits newer, incl.
+  `fix(kubeadm): restore kube-proxy CIDR (#1291)`) to stay on a tagged edge.
+
+## Conflicts (7) and resolution
+
+| File | Resolution |
+|---|---|
+| `controllers/soot/manager.go` | union: keep our `deploymentNotAvailable` teardown/guard, route probe and endpoint-observation ack; take upstream's `certificateSha` rotation case and its relocated `GetRESTClientConfig` (+`ErrMissingKubeconfigKey` requeue); drop our now-duplicate `GetRESTClientConfig`. |
+| `internal/builders/controlplane/deployment.go` | upstream's `defaultProbe()` (adds scheduler/CM readiness); our relaxed STARTUP probe preserved as `relaxedStartupProbe()` at the same three sites. |
+| `internal/builders/controlplane/konnectivity_server.go` | upstream (only comments differed). |
+| `internal/resources/kubeadm_phases.go` | upstream (our change was the #1172 backport). |
+| `go.mod` / `go.sum` | upstream + `go mod tidy`; `sigs.k8s.io/yaml` stays a direct dep (our kube-proxy JSON-patch code imports it). |
+| `charts/kamaji/Chart.lock` | upstream (Chart.yaml auto-merged to kamaji-etcd `>=0.15.0`; fleet runs `kamaji-etcd.deploy=false`). |
+
+## Verification performed
+
+- `go build ./...`, `go vet ./...` clean; `make generate manifests` reproduces
+  the auto-merged deepcopy + CRDs with zero diff.
+- `go test` (envtest 1.31.0, ABSOLUTE `KUBEBUILDER_ASSETS`): api/v1alpha1
+  (48 specs), 11 internal/* packages, controllers, controllers/soot — all ok.
+  Note: `make test` via the pinned `bin/ginkgo` CLI is unreliable now (CLI vs
+  library version mismatch after upstream bumped ginkgo); use plain `go test`.
+- TenantControlPlane/DataStore CRDs: additive only (no property removed) —
+  safe for the HelmRelease `crds: CreateReplace` path.
+- `helm lint` + `helm template` with fleet values (incl.
+  `tenantClientClusterIPCapability.enabled=true`) render.
+- Differential lint vs pure upstream at the same linter version; fork-owned
+  code fixed for every linter upstream is clean on (see commit
+  "fork: bring kube-dc code up to upstream's lint bar").
+- All fork feature markers present post-merge (external endpoints/ServerName,
+  ResizePolicy, kube-proxy configurationJSONPatches, datastore
+  managementEndpoints, soot watchdog + scale-to-zero guard, endpoint
+  observation, kubeconfig endpoint drift, konnectivity agent hardening,
+  kubelet v1.35 field strip, tenantClientClusterIPCapability).
+- Residual delta vs upstream: 30 files (was 40 against the old base).
+
+## Companion: cluster-api-control-plane-provider-kamaji
+
+Builds against `../kamaji` via `replace`. Re-pointed on branch
+`kube-dc-kubeproxy-kamaji-26.8.5` (commit `87ab646`): tidy + regenerated
+KCP CRDs (gain upstream's securityContext fields; `configurationJSONPatches`
+intact). Still provider v0.19.0 + our 3 commits; **v0.20.0 (api/v1alpha2,
+CAPI v1beta2) is a separate migration and was not taken.** Next image tag:
+`v0.19.0-kube-dc-v3`; fleet manifest regenerates from
+`kustomize build config/default` + image sed + clusterctl var defaults.
+
+## Release naming for this line
+
+Image `edge-26.8.5-v1-kube-dc` (counter restarts per upstream tag), chart
+`1.0.10-kube-dc`. Roll out stage -> cs/zrh -> cloud as in Merge #1 §5.
