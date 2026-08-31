@@ -64,7 +64,8 @@ helm install \
   cert-manager jetstack/cert-manager \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true
+  --version v1.18.3 \
+  --set crds.enabled=true
 ```
 
 ## Install Kamaji Controller
@@ -238,7 +239,7 @@ spec:
 Collect the external IP address of the `tcp` service:
 
 ```bash
-TENANT_ADDR=$(kubectl -n ${TENANT_NAMESPACE} get svc ${TENANT_NAME} -o json | jq -r ."spec.loadBalancerIP")
+TENANT_ADDR=$(kubectl -n ${TENANT_NAMESPACE} get svc ${TENANT_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
 ```
 
 and check it out:

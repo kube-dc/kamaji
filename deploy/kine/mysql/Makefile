@@ -31,4 +31,6 @@ mariadb-deployment:
 
 mariadb-destroy:
 	@NAME=$(NAME) envsubst < $(ROOT_DIR)/mariadb.yaml | kubectl -n $(NAMESPACE) delete --ignore-not-found -f -
-	@kubectl delete -n $(NAMESPACE) secret mysql-$(NAME)config --ignore-not-found
+	@kubectl delete -n $(NAMESPACE) secret mysql-$(NAME)-config --ignore-not-found
+	@kubectl delete namespace $(NAMESPACE) --ignore-not-found
+	@rm -rf $(ROOT_DIR)/certs/$(NAME)

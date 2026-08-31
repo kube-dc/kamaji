@@ -1,6 +1,6 @@
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 NAME:=default
-NAMESPACE:=kamaji-system
+NAMESPACE:=postgres-system
 
 postgresql: cnpg-setup cnpg-deploy postgresql-secret
 
@@ -25,5 +25,9 @@ postgresql-secret: cnpg
     		--cnpg-user $$(kubectl -n $(NAMESPACE) get secret postgres-$(NAME)-superuser -o jsonpath='{.data.username}' | base64 -d)
 
 postgresql-destroy:
-	@NAME=$(NAME) envsubst < postgresql.yaml | kubectl -n $(NAMESPACE) delete -f -
+	@NAME=$(NAME) envsubst < postgresql.yaml | kubectl -n $(NAMESPACE) delete --ignore-not-found -f -
 	@kubectl -n $(NAMESPACE) delete secret postgres-$(NAME)-root-cert --ignore-not-found
+	@kubectl -n $(NAMESPACE) delete secret postgres-$(NAME)-superuser --ignore-not-found
+	@kubectl delete namespace $(NAMESPACE) --ignore-not-found
+	@kubectl delete -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/main/releases/cnpg-1.18.0.yaml --ignore-not-found
+	@rm -f $(shell git rev-parse --show-toplevel)/bin/kubectl-cnpg

@@ -29,18 +29,33 @@ func (t TenantControlPlaneDefaults) OnCreate(object runtime.Object) AdmissionRes
 		t.defaultUnsetFields(defaulted)
 
 		if len(defaulted.Spec.NetworkProfile.DNSServiceIPs) == 0 {
-			ip, _, err := net.ParseCIDR(defaulted.Spec.NetworkProfile.ServiceCIDR)
-			if err != nil {
-				return nil, fmt.Errorf("cannot define resulting DNS Service IP: %w", err)
-			}
-			switch {
-			case ip.To4() != nil:
-				ip[len(ip)-1] += 10
-			case ip.To16() != nil:
-				ip[len(ip)-1] += 16
+			var cidrs []string
+
+			if len(defaulted.Spec.NetworkProfile.ServiceCIDRs) > 0 {
+				cidrs = defaulted.Spec.NetworkProfile.ServiceCIDRs
+			} else if defaulted.Spec.NetworkProfile.ServiceCIDR != "" {
+				// Backward compatibility
+				cidrs = []string{defaulted.Spec.NetworkProfile.ServiceCIDR}
 			}
 
-			defaulted.Spec.NetworkProfile.DNSServiceIPs = []string{ip.String()}
+			dnsIPs := make([]string, 0, len(cidrs))
+
+			for _, cidr := range cidrs {
+				ip, _, err := net.ParseCIDR(cidr)
+				if err != nil {
+					return nil, fmt.Errorf("cannot define resulting DNS Service IP: %w", err)
+				}
+
+				// Match kubeadm's DNS IP convention (the 10th address of the service
+				// subnet) for both families: 10.96.0.0/16 -> 10.96.0.10 and
+				// fd00::/120 -> fd00::a. Using a different offset for IPv6 would make
+				// the kubelet's cluster DNS disagree with the CoreDNS Service ClusterIP.
+				ip[len(ip)-1] += 10
+
+				dnsIPs = append(dnsIPs, ip.String())
+			}
+
+			defaulted.Spec.NetworkProfile.DNSServiceIPs = dnsIPs
 		}
 
 		operations, err := utils.JSONPatch(original, defaulted)
@@ -76,5 +91,14 @@ func (t TenantControlPlaneDefaults) defaultUnsetFields(tcp *kamajiv1alpha1.Tenan
 
 	if len(tcp.Spec.DataStoreUsername) == 0 {
 		tcp.Spec.DataStoreUsername = tcp.GetDefaultDatastoreUsername()
+	}
+
+	// Backward compatibility for serviceCidr and podCidr fields
+	if len(tcp.Spec.NetworkProfile.ServiceCIDRs) == 0 && tcp.Spec.NetworkProfile.ServiceCIDR != "" {
+		tcp.Spec.NetworkProfile.ServiceCIDRs = []string{tcp.Spec.NetworkProfile.ServiceCIDR}
+	}
+
+	if len(tcp.Spec.NetworkProfile.PodCIDRs) == 0 && tcp.Spec.NetworkProfile.PodCIDR != "" {
+		tcp.Spec.NetworkProfile.PodCIDRs = []string{tcp.Spec.NetworkProfile.PodCIDR}
 	}
 }

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -83,6 +82,45 @@ func (in *TenantControlPlane) DeclaredControlPlaneAddress(ctx context.Context, c
 	return "", kamajierrors.MissingValidIPError{}
 }
 
+// ControlPlaneServiceIPs returns every IP address the Tenant Control Plane Service
+// answers on: all of its ClusterIPs (covering both families of a dual-stack Service)
+// and all LoadBalancer ingress IPs. It is meant for certificate SANs, so it is
+// best-effort about IP availability: a not-yet-provisioned LoadBalancer simply yields
+// no ingress IPs rather than an error. A missing Service, in contrast, is returned as
+// an error. The caller is expected to also include the primary advertised/management
+// address.
+func (in *TenantControlPlane) ControlPlaneServiceIPs(ctx context.Context, c client.Client) ([]string, error) {
+	svc := &corev1.Service{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: in.GetNamespace(), Name: in.GetName()}, svc); err != nil {
+		return nil, fmt.Errorf("cannot retrieve Service for the TenantControlPlane: %w", err)
+	}
+
+	// ClusterIPs carries both families of a dual-stack Service; fall back to the
+	// singular ClusterIP for Services that only populate the legacy field.
+	clusterIPs := svc.Spec.ClusterIPs
+	if len(clusterIPs) == 0 && len(svc.Spec.ClusterIP) > 0 {
+		clusterIPs = []string{svc.Spec.ClusterIP}
+	}
+
+	ips := make([]string, 0, len(clusterIPs)+len(svc.Status.LoadBalancer.Ingress))
+
+	for _, ip := range clusterIPs {
+		if ip == "" || ip == corev1.ClusterIPNone {
+			continue
+		}
+
+		ips = append(ips, ip)
+	}
+
+	for _, ingress := range svc.Status.LoadBalancer.Ingress {
+		if len(ingress.IP) > 0 {
+			ips = append(ips, ingress.IP)
+		}
+	}
+
+	return ips, nil
+}
+
 // getLoadBalancerAddress extracts the IP address from LoadBalancer ingress.
 // It also checks and rejects hostname usage for LoadBalancer ingress.
 //
@@ -112,16 +150,10 @@ func getLoadBalancerAddress(ingress []corev1.LoadBalancerIngress) (string, error
 	return "", kamajierrors.MissingValidIPError{}
 }
 
-func (in *TenantControlPlane) normalizeNamespaceName() string {
-	// The dash character (-) must be replaced with an underscore, PostgreSQL is complaining about it:
-	// https://github.com/clastix/kamaji/issues/328
-	return strings.ReplaceAll(fmt.Sprintf("%s_%s", in.GetNamespace(), in.GetName()), "-", "_")
-}
-
 func (in *TenantControlPlane) GetDefaultDatastoreUsername() string {
-	return in.normalizeNamespaceName()
+	return string(in.UID)
 }
 
 func (in *TenantControlPlane) GetDefaultDatastoreSchema() string {
-	return in.normalizeNamespaceName()
+	return string(in.UID)
 }

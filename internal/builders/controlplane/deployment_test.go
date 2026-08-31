@@ -12,6 +12,7 @@ import (
 	pointer "k8s.io/utils/ptr"
 
 	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
+	"github.com/clastix/kamaji/internal/utilities"
 )
 
 func TestControlplaneDeployment(t *testing.T) {
@@ -121,6 +122,11 @@ var _ = Describe("Controlplane Deployment", func() {
 			Expect(probe.InitialDelaySeconds).To(Equal(int32(0)))
 			Expect(probe.SuccessThreshold).To(Equal(int32(1)))
 		})
+
+		It("should not panic when probe is nil", func() {
+			spec := &kamajiv1alpha1.ProbeSpec{PeriodSeconds: pointer.To(int32(20))}
+			Expect(func() { applyProbeOverrides(nil, spec) }).ToNot(Panic())
+		})
 	})
 
 	Describe("mergeAPIServerArgs", func() {
@@ -198,6 +204,189 @@ var _ = Describe("Controlplane Deployment", func() {
 				"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
 				"--service-cluster-ip-range=10.96.0.0/12",
 			}))
+		})
+	})
+
+	Describe("control plane probes", func() {
+		// helper: find a container by name in a built PodSpec
+		containerByName := func(spec *corev1.PodSpec, name string) corev1.Container {
+			for _, c := range spec.Containers {
+				if c.Name == name {
+					return c
+				}
+			}
+			Fail("container not found: " + name)
+
+			return corev1.Container{}
+		}
+
+		It("renders a readiness probe for kube-scheduler on /healthz:10259", func() {
+			podSpec := &corev1.PodSpec{}
+			d.buildScheduler(podSpec, kamajiv1alpha1.TenantControlPlane{})
+
+			c := containerByName(podSpec, "kube-scheduler")
+			Expect(c.ReadinessProbe).ToNot(BeNil())
+			Expect(c.ReadinessProbe.HTTPGet.Path).To(Equal("/healthz"))
+			Expect(c.ReadinessProbe.HTTPGet.Port.IntValue()).To(Equal(10259))
+			Expect(c.ReadinessProbe.HTTPGet.Scheme).To(Equal(corev1.URISchemeHTTPS))
+			Expect(c.ReadinessProbe.PeriodSeconds).To(Equal(int32(10)))
+		})
+
+		It("renders a readiness probe for kube-controller-manager on /healthz:10257", func() {
+			podSpec := &corev1.PodSpec{}
+			d.buildControllerManager(podSpec, kamajiv1alpha1.TenantControlPlane{})
+
+			c := containerByName(podSpec, "kube-controller-manager")
+			Expect(c.ReadinessProbe).ToNot(BeNil())
+			Expect(c.ReadinessProbe.HTTPGet.Path).To(Equal("/healthz"))
+			Expect(c.ReadinessProbe.HTTPGet.Port.IntValue()).To(Equal(10257))
+			Expect(c.ReadinessProbe.HTTPGet.Scheme).To(Equal(corev1.URISchemeHTTPS))
+		})
+
+		It("cascades global then component readiness overrides onto the scheduler", func() {
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.ControlPlane.Deployment.Probes = &kamajiv1alpha1.ControlPlaneProbes{
+				Readiness: &kamajiv1alpha1.ProbeSpec{PeriodSeconds: pointer.To(int32(20))},
+				Scheduler: &kamajiv1alpha1.ProbeSet{
+					Readiness: &kamajiv1alpha1.ProbeSpec{PeriodSeconds: pointer.To(int32(30))},
+				},
+			}
+
+			podSpec := &corev1.PodSpec{}
+			d.buildScheduler(podSpec, tcp)
+
+			c := containerByName(podSpec, "kube-scheduler")
+			Expect(c.ReadinessProbe.PeriodSeconds).To(Equal(int32(30))) // component wins over global
+		})
+
+		It("applies a global-only readiness override to the scheduler", func() {
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.ControlPlane.Deployment.Probes = &kamajiv1alpha1.ControlPlaneProbes{
+				Readiness: &kamajiv1alpha1.ProbeSpec{PeriodSeconds: pointer.To(int32(20))},
+			}
+
+			podSpec := &corev1.PodSpec{}
+			d.buildScheduler(podSpec, tcp)
+
+			c := containerByName(podSpec, "kube-scheduler")
+			Expect(c.ReadinessProbe.PeriodSeconds).To(Equal(int32(20)))
+		})
+
+		It("leaves the kube-apiserver probes unchanged (regression guard)", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.NetworkProfile.Port = 6443
+			d.buildKubeAPIServer(podSpec, tcp, "")
+
+			c := containerByName(podSpec, "kube-apiserver")
+			Expect(c.LivenessProbe.HTTPGet.Path).To(Equal("/livez"))
+			Expect(c.ReadinessProbe.HTTPGet.Path).To(Equal("/readyz"))
+			Expect(c.StartupProbe.HTTPGet.Path).To(Equal("/livez"))
+			Expect(c.ReadinessProbe.HTTPGet.Port.IntValue()).To(Equal(6443))
+		})
+	})
+
+	Describe("ServiceAccount", func() {
+		It("should default to 'default' SA with nil automount", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			d.setServiceAccount(podSpec, tcp)
+			Expect(podSpec.ServiceAccountName).To(Equal("default"))
+			Expect(podSpec.AutomountServiceAccountToken).To(BeNil())
+		})
+
+		It("should set a custom SA name with nil automount", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.ControlPlane.Deployment.ServiceAccountName = "custom-sa"
+			d.setServiceAccount(podSpec, tcp)
+			Expect(podSpec.ServiceAccountName).To(Equal("custom-sa"))
+			Expect(podSpec.AutomountServiceAccountToken).To(BeNil())
+		})
+
+		It("should enable automount when AutomountServiceAccountToken is true", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.ControlPlane.Deployment.AutomountServiceAccountToken = pointer.To(true)
+			d.setServiceAccount(podSpec, tcp)
+			Expect(podSpec.ServiceAccountName).To(Equal("default"))
+			Expect(podSpec.AutomountServiceAccountToken).ToNot(BeNil())
+			Expect(*podSpec.AutomountServiceAccountToken).To(BeTrue())
+		})
+
+		It("should disable automount when AutomountServiceAccountToken is false", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.ControlPlane.Deployment.AutomountServiceAccountToken = pointer.To(false)
+			tcp.Spec.ControlPlane.Deployment.ServiceAccountName = "another-sa"
+			d.setServiceAccount(podSpec, tcp)
+			Expect(podSpec.ServiceAccountName).To(Equal("another-sa"))
+			Expect(podSpec.AutomountServiceAccountToken).ToNot(BeNil())
+			Expect(*podSpec.AutomountServiceAccountToken).To(BeFalse())
+		})
+	})
+
+	Describe("Kine container image override", func() {
+		var tcp kamajiv1alpha1.TenantControlPlane
+		BeforeEach(func() {
+			d.KineContainerImage = "rancher/kine:v0.11.0"
+			d.DataStore = kamajiv1alpha1.DataStore{
+				Spec: kamajiv1alpha1.DataStoreSpec{
+					Driver: kamajiv1alpha1.KinePostgreSQLDriver,
+				},
+			}
+			tcp = kamajiv1alpha1.TenantControlPlane{}
+			tcp.Status.Storage = kamajiv1alpha1.StorageStatus{
+				Config: kamajiv1alpha1.DataStoreConfigStatus{
+					SecretName: "test-secret",
+				},
+			}
+		})
+
+		It("should use default kine image when not overridden", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp.Spec.ControlPlane.Deployment.AdditionalContainers = []corev1.Container{}
+
+			d.setAdditionalContainers(podSpec, tcp)
+			d.buildKine(podSpec, tcp)
+
+			found, index := utilities.HasNamedContainer(podSpec.Containers, "kine")
+			Expect(found).To(BeTrue())
+			Expect(podSpec.Containers[index].Image).To(Equal("rancher/kine:v0.11.0"))
+		})
+
+		It("should use custom kine image when overridden via additionalContainers", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp.Spec.ControlPlane.Deployment.AdditionalContainers = []corev1.Container{
+				{
+					Name:  "kine",
+					Image: "my-custom-kine:v1.0.0",
+				},
+			}
+
+			d.setAdditionalContainers(podSpec, tcp)
+			d.buildKine(podSpec, tcp)
+
+			found, index := utilities.HasNamedContainer(podSpec.Containers, "kine")
+			Expect(found).To(BeTrue())
+			Expect(podSpec.Containers[index].Image).To(Equal("my-custom-kine:v1.0.0"))
+		})
+
+		It("should preserve custom kine container image when set via additionalContainers", func() {
+			podSpec := &corev1.PodSpec{}
+			tcp.Spec.ControlPlane.Deployment.AdditionalContainers = []corev1.Container{
+				{
+					Name:  "kine",
+					Image: "custom-kine:latest",
+				},
+			}
+
+			d.setAdditionalContainers(podSpec, tcp)
+			d.buildKine(podSpec, tcp)
+
+			found, index := utilities.HasNamedContainer(podSpec.Containers, "kine")
+			Expect(found).To(BeTrue())
+			Expect(podSpec.Containers[index].Image).To(Equal("custom-kine:latest"))
 		})
 	})
 })

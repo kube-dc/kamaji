@@ -593,6 +593,7 @@ metadata:
   name: cert-manager
   namespace: ${CLUSTER_NAMESPACE}
 spec:
+  version: v1.18.3
   clusterSelector:
     matchLabels:
       addons.cluster.x-k8s.io/cert-manager: "true"
@@ -608,7 +609,8 @@ spec:
     upgrade:
       maxHistory: 10
   valuesTemplate: |
-    installCRDs: true
+    crds: 
+      enabled: true
 ---
 apiVersion: addons.cluster.x-k8s.io/v1alpha1
 kind: HelmChartProxy

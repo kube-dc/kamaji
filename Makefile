@@ -257,7 +257,15 @@ run: manifests generate ## Run a controller from your host.
 build: $(KO)
 	LD_FLAGS=$(LD_FLAGS) \
 	KOCACHE=/tmp/ko-cache KO_DOCKER_REPO=${CONTAINER_REPOSITORY} \
-	$(KO) build ./ --bare --tags=$(VERSION) --local=$(KO_LOCAL) --push=$(KO_PUSH)
+	$(KO) build ./ --bare --tags=$(VERSION) --local=$(KO_LOCAL) --push=$(KO_PUSH) \
+		--image-label "org.opencontainers.image.authors=Clastix https://clastix.io/" \
+		--image-label "org.opencontainers.image.title=Kamaji" \
+		--image-label "org.opencontainers.image.vendor=Clastix" \
+		--image-label "org.opencontainers.image.source=https://github.com/clastix/kamaji" \
+		--image-label "org.opencontainers.image.url=https://kamaji.clastix.io" \
+		--image-label "org.opencontainers.image.created=$$(date --utc '+%FT%H:%M:%SZ')" \
+		--image-label "org.opencontainers.image.revision=$(GIT_HEAD_COMMIT)" \
+		--image-label "org.opencontainers.image.version=$(VERSION)"
 
 ##@ Development
 
@@ -281,17 +289,11 @@ gateway-api:
 		--server-side \
 		--force-conflicts \
 		--field-manager=helm \
-		-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/standard-install.yaml
-	# Required for the TLSRoutes. Experimentals.
-	kubectl apply \
-		--server-side \
-		--force-conflicts \
-		--field-manager=helm \
-		-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.0/experimental-install.yaml
+		-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
 	kubectl wait --for=condition=Established crd/gateways.gateway.networking.k8s.io --timeout=60s
 
-envoy-gateway: gateway-api helm ## Install Envoy Gateway for Gateway API tests.
-	$(HELM) upgrade --install eg oci://docker.io/envoyproxy/gateway-helm --version v1.6.1 -n envoy-gateway-system --create-namespace
+envoy-gateway: gateway-api helm  ## Install Envoy Gateway for Gateway API tests, with skip-crds to avoid conflicts with the CRDs installed by Gateway API.
+	$(HELM) upgrade --install eg oci://docker.io/envoyproxy/gateway-helm --version v1.8.0 -n envoy-gateway-system --create-namespace --skip-crds
 	kubectl wait --timeout=5m -n envoy-gateway-system deployment/envoy-gateway --for=condition=Available
 
 load: kind

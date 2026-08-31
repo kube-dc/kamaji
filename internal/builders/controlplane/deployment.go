@@ -52,7 +52,7 @@ const (
 )
 
 func applyProbeOverrides(probe *corev1.Probe, spec *kamajiv1alpha1.ProbeSpec) {
-	if spec == nil {
+	if probe == nil || spec == nil {
 		return
 	}
 
@@ -61,6 +61,60 @@ func applyProbeOverrides(probe *corev1.Probe, spec *kamajiv1alpha1.ProbeSpec) {
 	probe.PeriodSeconds = pointer.Deref(spec.PeriodSeconds, probe.PeriodSeconds)
 	probe.SuccessThreshold = pointer.Deref(spec.SuccessThreshold, probe.SuccessThreshold)
 	probe.FailureThreshold = pointer.Deref(spec.FailureThreshold, probe.FailureThreshold)
+}
+
+// defaultProbe builds the standard HTTPS probe shared by all control plane
+// components; only the path and port differ between components and probe types.
+func defaultProbe(path string, port int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path:   path,
+				Port:   intstr.FromInt32(port),
+				Scheme: corev1.URISchemeHTTPS,
+			},
+		},
+		InitialDelaySeconds: 0,
+		TimeoutSeconds:      1,
+		PeriodSeconds:       10,
+		SuccessThreshold:    1,
+		FailureThreshold:    3,
+	}
+}
+
+// relaxedStartupProbe is the kube-dc fork default for the control-plane
+// startup probes: 10 failures x 10s period with a 5s timeout, i.e. 100s of
+// startup grace instead of upstream's 30s. Tenant apiservers on slow or
+// contended datastores exceeded upstream's window and crash-looped before
+// they ever served. Liveness/readiness keep upstream's defaults. Any of them
+// can still be overridden per TenantControlPlane through
+// spec.controlPlane.deployment.probes, which applyProbeSetOverrides applies
+// after these defaults. (fork: 8749302)
+func relaxedStartupProbe(path string, port int32) *corev1.Probe {
+	p := defaultProbe(path, port)
+	p.TimeoutSeconds = 5
+	p.FailureThreshold = 10
+
+	return p
+}
+
+// applyProbeSetOverrides applies the global probe overrides first, then the
+// per-component overrides, to every probe of the container. Probe pointers that
+// are nil are skipped (applyProbeOverrides is nil-safe).
+func applyProbeSetOverrides(c *corev1.Container, probes *kamajiv1alpha1.ControlPlaneProbes, set *kamajiv1alpha1.ProbeSet) {
+	if probes == nil {
+		return
+	}
+
+	applyProbeOverrides(c.LivenessProbe, probes.Liveness)
+	applyProbeOverrides(c.ReadinessProbe, probes.Readiness)
+	applyProbeOverrides(c.StartupProbe, probes.Startup)
+
+	if set != nil {
+		applyProbeOverrides(c.LivenessProbe, set.Liveness)
+		applyProbeOverrides(c.ReadinessProbe, set.Readiness)
+		applyProbeOverrides(c.StartupProbe, set.Startup)
+	}
 }
 
 type DataStoreOverrides struct {
@@ -78,10 +132,20 @@ type Deployment struct {
 func (d Deployment) Build(ctx context.Context, deployment *appsv1.Deployment, tenantControlPlane kamajiv1alpha1.TenantControlPlane) {
 	address, _, _ := tenantControlPlane.AssignedControlPlaneAddress()
 
-	d.setLabels(deployment, utilities.MergeMaps(utilities.KamajiLabels(tenantControlPlane.GetName(), "deployment"), tenantControlPlane.Spec.ControlPlane.Deployment.AdditionalMetadata.Labels))
+	d.setLabels(deployment, utilities.MergeMaps(
+		deployment.GetLabels(),
+		utilities.KamajiLabels(tenantControlPlane.GetName(), "deployment"),
+		tenantControlPlane.Spec.ControlPlane.Deployment.AdditionalMetadata.Labels,
+	))
 	d.setAnnotations(deployment, utilities.MergeMaps(deployment.Annotations, tenantControlPlane.Spec.ControlPlane.Deployment.AdditionalMetadata.Annotations))
 	d.setTemplateLabels(&deployment.Spec.Template, utilities.MergeMaps(d.templateLabels(ctx, &tenantControlPlane), tenantControlPlane.Spec.ControlPlane.Deployment.PodAdditionalMetadata.Labels))
-	d.setTemplateAnnotations(&deployment.Spec.Template, utilities.MergeMaps(tenantControlPlane.Spec.ControlPlane.Deployment.PodAdditionalMetadata.Annotations, map[string]string{"storage.kamaji.clastix.io/config": tenantControlPlane.Status.Storage.Config.Checksum}))
+	d.setTemplateAnnotations(&deployment.Spec.Template, utilities.MergeMaps(tenantControlPlane.Spec.ControlPlane.Deployment.PodAdditionalMetadata.Annotations, map[string]string{
+		// The following annotations are used to trigger a rollout in case of any change:
+		// - configuration changes
+		// - certificate changes, or CA rotation
+		"storage.kamaji.clastix.io/config":      tenantControlPlane.Status.Storage.Config.Checksum,
+		"storage.kamaji.clastix.io/certificate": tenantControlPlane.Status.Storage.Certificate.Checksum,
+	}))
 	d.setNodeSelector(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setToleration(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setAffinity(&deployment.Spec.Template.Spec, tenantControlPlane)
@@ -94,6 +158,7 @@ func (d Deployment) Build(ctx context.Context, deployment *appsv1.Deployment, te
 	d.setInitContainers(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setAdditionalContainers(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setContainers(&deployment.Spec.Template.Spec, tenantControlPlane, address)
+	d.setSecurityContext(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setAdditionalVolumes(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setVolumes(&deployment.Spec.Template.Spec, tenantControlPlane)
 	d.setServiceAccount(&deployment.Spec.Template.Spec, tenantControlPlane)
@@ -367,43 +432,18 @@ func (d Deployment) buildScheduler(podSpec *corev1.PodSpec, tenantControlPlane k
 	podSpec.Containers[index].Image = tenantControlPlane.Spec.ControlPlane.Deployment.RegistrySettings.KubeSchedulerImage(tenantControlPlane.Spec.Kubernetes.Version)
 	podSpec.Containers[index].Command = []string{"kube-scheduler"}
 	podSpec.Containers[index].Args = utilities.ArgsFromMapToSlice(args)
-	podSpec.Containers[index].LivenessProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/healthz",
-				Port:   intstr.FromInt32(10259),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      1,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
-	podSpec.Containers[index].StartupProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/healthz",
-				Port:   intstr.FromInt32(10259),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      5,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    10,
-	}
+	podSpec.Containers[index].LivenessProbe = defaultProbe("/healthz", 10259)
+	podSpec.Containers[index].ReadinessProbe = defaultProbe("/healthz", 10259)
+	podSpec.Containers[index].StartupProbe = relaxedStartupProbe("/healthz", 10259)
 
 	if probes := tenantControlPlane.Spec.ControlPlane.Deployment.Probes; probes != nil {
-		applyProbeOverrides(podSpec.Containers[index].LivenessProbe, probes.Liveness)
-		applyProbeOverrides(podSpec.Containers[index].StartupProbe, probes.Startup)
+		applyProbeSetOverrides(&podSpec.Containers[index], probes, probes.Scheduler)
+	}
 
-		if probes.Scheduler != nil {
-			applyProbeOverrides(podSpec.Containers[index].LivenessProbe, probes.Scheduler.Liveness)
-			applyProbeOverrides(podSpec.Containers[index].StartupProbe, probes.Scheduler.Startup)
-		}
+	if containerSecurityContexts := tenantControlPlane.Spec.ControlPlane.Deployment.ContainerSecurityContexts; containerSecurityContexts != nil {
+		podSpec.Containers[index].SecurityContext = containerSecurityContexts.Scheduler
+	} else {
+		podSpec.Containers[index].SecurityContext = nil
 	}
 
 	switch {
@@ -448,6 +488,10 @@ func (d Deployment) buildControllerManager(podSpec *corev1.PodSpec, tenantContro
 		podSpec.Containers = append(podSpec.Containers, corev1.Container{})
 	}
 
+	// backward compatibility for deprecated CIDR fields
+	serviceCIDRs := utilities.GetEffectiveCIDRs(tenantControlPlane.Spec.NetworkProfile.ServiceCIDR, tenantControlPlane.Spec.NetworkProfile.ServiceCIDRs)
+	podCIDRs := utilities.GetEffectiveCIDRs(tenantControlPlane.Spec.NetworkProfile.PodCIDR, tenantControlPlane.Spec.NetworkProfile.PodCIDRs)
+
 	kubeconfig := "/etc/kubernetes/controller-manager.conf"
 
 	args := map[string]string{
@@ -462,8 +506,8 @@ func (d Deployment) buildControllerManager(podSpec *corev1.PodSpec, tenantContro
 		"--controllers":                      "*,bootstrapsigner,tokencleaner",
 		"--kubeconfig":                       kubeconfig,
 		"--leader-elect":                     "true",
-		"--service-cluster-ip-range":         tenantControlPlane.Spec.NetworkProfile.ServiceCIDR,
-		"--cluster-cidr":                     tenantControlPlane.Spec.NetworkProfile.PodCIDR,
+		"--service-cluster-ip-range":         strings.Join(serviceCIDRs, ","),
+		"--cluster-cidr":                     strings.Join(podCIDRs, ","),
 		"--requestheader-client-ca-file":     path.Join(v1beta3.DefaultCertificatesDir, constants.FrontProxyCACertName),
 		"--root-ca-file":                     path.Join(v1beta3.DefaultCertificatesDir, constants.CACertName),
 		"--service-account-private-key-file": path.Join(v1beta3.DefaultCertificatesDir, constants.ServiceAccountPrivateKeyName),
@@ -478,43 +522,18 @@ func (d Deployment) buildControllerManager(podSpec *corev1.PodSpec, tenantContro
 	podSpec.Containers[index].Image = tenantControlPlane.Spec.ControlPlane.Deployment.RegistrySettings.KubeControllerManagerImage(tenantControlPlane.Spec.Kubernetes.Version)
 	podSpec.Containers[index].Command = []string{"kube-controller-manager"}
 	podSpec.Containers[index].Args = utilities.ArgsFromMapToSlice(args)
-	podSpec.Containers[index].LivenessProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/healthz",
-				Port:   intstr.FromInt32(10257),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      1,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
-	podSpec.Containers[index].StartupProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/healthz",
-				Port:   intstr.FromInt32(10257),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      5,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    10,
-	}
+	podSpec.Containers[index].LivenessProbe = defaultProbe("/healthz", 10257)
+	podSpec.Containers[index].ReadinessProbe = defaultProbe("/healthz", 10257)
+	podSpec.Containers[index].StartupProbe = relaxedStartupProbe("/healthz", 10257)
 
 	if probes := tenantControlPlane.Spec.ControlPlane.Deployment.Probes; probes != nil {
-		applyProbeOverrides(podSpec.Containers[index].LivenessProbe, probes.Liveness)
-		applyProbeOverrides(podSpec.Containers[index].StartupProbe, probes.Startup)
+		applyProbeSetOverrides(&podSpec.Containers[index], probes, probes.ControllerManager)
+	}
 
-		if probes.ControllerManager != nil {
-			applyProbeOverrides(podSpec.Containers[index].LivenessProbe, probes.ControllerManager.Liveness)
-			applyProbeOverrides(podSpec.Containers[index].StartupProbe, probes.ControllerManager.Startup)
-		}
+	if containerSecurityContexts := tenantControlPlane.Spec.ControlPlane.Deployment.ContainerSecurityContexts; containerSecurityContexts != nil {
+		podSpec.Containers[index].SecurityContext = containerSecurityContexts.ControllerManager
+	} else {
+		podSpec.Containers[index].SecurityContext = nil
 	}
 
 	switch {
@@ -611,59 +630,18 @@ func (d Deployment) buildKubeAPIServer(podSpec *corev1.PodSpec, tenantControlPla
 	podSpec.Containers[index].Args = args
 	podSpec.Containers[index].Image = tenantControlPlane.Spec.ControlPlane.Deployment.RegistrySettings.KubeAPIServerImage(tenantControlPlane.Spec.Kubernetes.Version)
 	podSpec.Containers[index].Command = []string{"kube-apiserver"}
-	podSpec.Containers[index].LivenessProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/livez",
-				Port:   intstr.FromInt32(tenantControlPlane.Spec.NetworkProfile.Port),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      1,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
-	podSpec.Containers[index].ReadinessProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/readyz",
-				Port:   intstr.FromInt32(tenantControlPlane.Spec.NetworkProfile.Port),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      1,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
-	podSpec.Containers[index].StartupProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Path:   "/livez",
-				Port:   intstr.FromInt32(tenantControlPlane.Spec.NetworkProfile.Port),
-				Scheme: corev1.URISchemeHTTPS,
-			},
-		},
-		InitialDelaySeconds: 0,
-		TimeoutSeconds:      5,
-		PeriodSeconds:       10,
-		SuccessThreshold:    1,
-		FailureThreshold:    10,
-	}
+	podSpec.Containers[index].LivenessProbe = defaultProbe("/livez", tenantControlPlane.Spec.NetworkProfile.Port)
+	podSpec.Containers[index].ReadinessProbe = defaultProbe("/readyz", tenantControlPlane.Spec.NetworkProfile.Port)
+	podSpec.Containers[index].StartupProbe = relaxedStartupProbe("/livez", tenantControlPlane.Spec.NetworkProfile.Port)
 
 	if probes := tenantControlPlane.Spec.ControlPlane.Deployment.Probes; probes != nil {
-		applyProbeOverrides(podSpec.Containers[index].LivenessProbe, probes.Liveness)
-		applyProbeOverrides(podSpec.Containers[index].ReadinessProbe, probes.Readiness)
-		applyProbeOverrides(podSpec.Containers[index].StartupProbe, probes.Startup)
+		applyProbeSetOverrides(&podSpec.Containers[index], probes, probes.APIServer)
+	}
 
-		if probes.APIServer != nil {
-			applyProbeOverrides(podSpec.Containers[index].LivenessProbe, probes.APIServer.Liveness)
-			applyProbeOverrides(podSpec.Containers[index].ReadinessProbe, probes.APIServer.Readiness)
-			applyProbeOverrides(podSpec.Containers[index].StartupProbe, probes.APIServer.Startup)
-		}
+	if containerSecurityContexts := tenantControlPlane.Spec.ControlPlane.Deployment.ContainerSecurityContexts; containerSecurityContexts != nil {
+		podSpec.Containers[index].SecurityContext = containerSecurityContexts.APIServer
+	} else {
+		podSpec.Containers[index].SecurityContext = nil
 	}
 
 	podSpec.Containers[index].ImagePullPolicy = corev1.PullAlways
@@ -746,19 +724,28 @@ func (d Deployment) buildKubeAPIServerCommand(tenantControlPlane kamajiv1alpha1.
 	// Opinionated defaults: applied only when the user didn't provide the same flag in ExtraArgs.
 	safeDefaults := map[string]string{
 		"--allow-privileged":                   "true",
-		"--authorization-mode":                 "Node,RBAC",
 		"--enable-bootstrap-token-auth":        "true",
 		"--requestheader-extra-headers-prefix": "X-Remote-Extra-",
 		"--requestheader-group-headers":        "X-Remote-Group",
 		"--requestheader-username-headers":     "X-Remote-User",
 		"--service-account-issuer":             "https://kubernetes.default.svc.cluster.local",
 	}
+
+	// https://github.com/kubernetes/kubernetes/blob/6720f0f96000abb82ad51d1177489b04188819d8/cmd/kubeadm/app/phases/controlplane/manifests.go#L253-L255
+	// Mirror kubeadm's mutually exclusive configuration
+	if _, ok := utilities.ArgsFromSliceToMap(userExtras)["--authorization-config"]; !ok {
+		safeDefaults["--authorization-mode"] = "Node,RBAC"
+	}
+
+	// backward compatibility for deprecated CIDR fields
+	serviceCIDRs := utilities.GetEffectiveCIDRs(tenantControlPlane.Spec.NetworkProfile.ServiceCIDR, tenantControlPlane.Spec.NetworkProfile.ServiceCIDRs)
+
 	// Managed flags: derived from the TCP spec, always applied, override any user duplicate.
 	managed := map[string]string{
 		"--advertise-address":                apiAdvertiseAddress,
 		"--client-ca-file":                   path.Join(v1beta3.DefaultCertificatesDir, constants.CACertName),
 		"--enable-admission-plugins":         strings.Join(tenantControlPlane.Spec.Kubernetes.AdmissionControllers.ToSlice(), ","),
-		"--service-cluster-ip-range":         tenantControlPlane.Spec.NetworkProfile.ServiceCIDR,
+		"--service-cluster-ip-range":         strings.Join(serviceCIDRs, ","),
 		"--kubelet-client-certificate":       path.Join(v1beta3.DefaultCertificatesDir, constants.APIServerKubeletClientCertName),
 		"--kubelet-client-key":               path.Join(v1beta3.DefaultCertificatesDir, constants.APIServerKubeletClientKeyName),
 		"--kubelet-preferred-address-types":  strings.Join(kubeletPreferredAddressTypes, ","),
@@ -1008,7 +995,9 @@ func (d Deployment) buildKine(podSpec *corev1.PodSpec, tcp kamajiv1alpha1.Tenant
 		}
 
 		podSpec.InitContainers[index].Name = kineInitContainerName
-		podSpec.InitContainers[index].Image = d.KineContainerImage
+		if podSpec.InitContainers[index].Image == "" {
+			podSpec.InitContainers[index].Image = d.KineContainerImage
+		}
 		podSpec.InitContainers[index].Command = []string{"sh"}
 
 		podSpec.InitContainers[index].Args = []string{
@@ -1067,7 +1056,9 @@ func (d Deployment) buildKine(podSpec *corev1.PodSpec, tcp kamajiv1alpha1.Tenant
 	}
 
 	podSpec.Containers[index].Name = kineContainerName
-	podSpec.Containers[index].Image = d.KineContainerImage
+	if podSpec.Containers[index].Image == "" {
+		podSpec.Containers[index].Image = d.KineContainerImage
+	}
 	podSpec.Containers[index].Command = []string{"/bin/kine"}
 	podSpec.Containers[index].Args = utilities.ArgsFromMapToSlice(args)
 	podSpec.Containers[index].VolumeMounts = []corev1.VolumeMount{
@@ -1265,6 +1256,8 @@ func (d Deployment) setAffinity(spec *corev1.PodSpec, tcp kamajiv1alpha1.TenantC
 }
 
 func (d Deployment) setServiceAccount(spec *corev1.PodSpec, tcp kamajiv1alpha1.TenantControlPlane) {
+	spec.AutomountServiceAccountToken = tcp.Spec.ControlPlane.Deployment.AutomountServiceAccountToken
+
 	if len(tcp.Spec.ControlPlane.Deployment.ServiceAccountName) > 0 {
 		spec.ServiceAccountName = tcp.Spec.ControlPlane.Deployment.ServiceAccountName
 
@@ -1272,4 +1265,8 @@ func (d Deployment) setServiceAccount(spec *corev1.PodSpec, tcp kamajiv1alpha1.T
 	}
 
 	spec.ServiceAccountName = "default"
+}
+
+func (d Deployment) setSecurityContext(spec *corev1.PodSpec, tcp kamajiv1alpha1.TenantControlPlane) {
+	spec.SecurityContext = tcp.Spec.ControlPlane.Deployment.PodSecurityContext
 }

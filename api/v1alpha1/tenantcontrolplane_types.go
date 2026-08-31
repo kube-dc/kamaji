@@ -12,7 +12,6 @@ import (
 )
 
 // NetworkProfileSpec defines the desired state of NetworkProfile.
-// +kubebuilder:validation:XValidation:rule="!has(self.dnsServiceIPs) || self.dnsServiceIPs.all(r, cidr(self.serviceCidr).containsIP(r))",message="all DNS service IPs must be part of the Service CIDR"
 type NetworkProfileSpec struct {
 	// LoadBalancerSourceRanges restricts the IP ranges that can access
 	// the LoadBalancer type Service. This field defines a list of IP
@@ -32,10 +31,17 @@ type NetworkProfileSpec struct {
 	// Address where API server will be exposed.
 	// In the case of LoadBalancer Service, this can be empty in order to use the exposed IP provided by the cloud controller manager.
 	Address string `json:"address,omitempty"`
-	// AdvertiseAddress is the address advertised to tenant-side consumers (workers, konnectivity).
-	// When set, the management address is used for CAPI and status reporting, while this address
-	// is used for kubeadm ControlPlaneEndpoint, cluster-info, and admin.conf.
-	// Both addresses are included in the API server certificate SANs.
+	// AdvertiseAddress is the IP address advertised to tenant-side consumers (workers, konnectivity).
+	// It is passed to the API server's --advertise-address flag and used for the kubeadm
+	// ControlPlaneEndpoint, cluster-info, and admin.conf; when set, the management address is used
+	// for CAPI and status reporting. Both addresses are included in the API server certificate SANs.
+	//
+	// This must be an IP address, not a DNS name: --advertise-address and the in-tenant "kubernetes"
+	// Service endpoints only accept IPs. To expose the control plane under a hostname, point a DNS
+	// record at a stable VIP and add the hostname to networkProfile.certSANs; for L7/hostname exposure
+	// see spec.controlPlane.ingress / spec.controlPlane.gateway (mind the TLS-passthrough caveats for
+	// client-certificate authentication).
+	//+kubebuilder:validation:XValidation:rule="self == '' || isIP(self)",message="advertiseAddress must be a valid IP address"
 	AdvertiseAddress string `json:"advertiseAddress,omitempty"`
 	// The default domain name used for DNS resolution within the cluster.
 	//+kubebuilder:default="cluster.local"
@@ -52,15 +58,33 @@ type NetworkProfileSpec struct {
 	// Use this field to add additional hostnames when exposing the Tenant Control Plane with third solutions.
 	CertSANs []string `json:"certSANs,omitempty"`
 	// CIDR for Kubernetes Services: if empty, defaulted to 10.96.0.0/16.
+	// Deprecated: use ServiceCIDRs instead.
 	//+kubebuilder:default="10.96.0.0/16"
 	//+kubebuilder:validation:Optional
 	//+kubebuilder:validation:XValidation:rule="self == '' || isCIDR(self)",message="serviceCidr must be empty or a valid CIDR"
 	ServiceCIDR string `json:"serviceCidr,omitempty"`
+	// Service CIDRs for Kubernetes Services.
+	// Supports single-stack and dual-stack configurations.
+	// When specified, this field takes precedence over ServiceCIDR.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:XValidation:rule="self.all(x, isCIDR(x))",message="all serviceCidrs entries must be valid CIDRs"
+	ServiceCIDRs []string `json:"serviceCidrs,omitempty"`
 	// CIDR for Kubernetes Pods: if empty, defaulted to 10.244.0.0/16.
+	// Deprecated: use PodCIDRs instead.
 	//+kubebuilder:default="10.244.0.0/16"
 	//+kubebuilder:validation:Optional
 	//+kubebuilder:validation:XValidation:rule="self == '' || isCIDR(self)",message="podCidr must be empty or a valid CIDR"
 	PodCIDR string `json:"podCidr,omitempty"`
+	// PodCIDRs defines one or more CIDRs for Kubernetes Pods.
+	// Supports single-stack and dual-stack configurations.
+	// When specified, this field takes precedence over PodCIDR.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:XValidation:rule="self.all(x, isCIDR(x))",message="all podCidrs entries must be valid CIDRs"
+	PodCIDRs []string `json:"podCidrs,omitempty"`
 	// The DNS Service for internal resolution, it must match the Service CIDR.
 	// In case of an empty value, it is automatically computed according to the Service CIDR, e.g.:
 	// Service CIDR 10.96.0.0/16, the resulting DNS Service IP will be 10.96.0.10 for IPv4,
@@ -223,7 +247,7 @@ type ProbeSet struct {
 type ControlPlaneProbes struct {
 	// Liveness defines default parameters for liveness probes of all Control Plane components.
 	Liveness *ProbeSpec `json:"liveness,omitempty"`
-	// Readiness defines default parameters for the readiness probe of kube-apiserver.
+	// Readiness defines default parameters for readiness probes of all Control Plane components.
 	Readiness *ProbeSpec `json:"readiness,omitempty"`
 	// Startup defines default parameters for startup probes of all Control Plane components.
 	Startup *ProbeSpec `json:"startup,omitempty"`
@@ -233,6 +257,16 @@ type ControlPlaneProbes struct {
 	ControllerManager *ProbeSet `json:"controllerManager,omitempty"`
 	// Scheduler defines probe overrides for kube-scheduler, taking precedence over global probe settings.
 	Scheduler *ProbeSet `json:"scheduler,omitempty"`
+}
+
+// ControlPlaneContainerSecurityContexts defines security contexts for individual Control Plane component containers.
+type ControlPlaneContainerSecurityContexts struct {
+	// APIServer defines the security context for the kube-apiserver container.
+	APIServer *corev1.SecurityContext `json:"apiServer,omitempty"`
+	// ControllerManager defines the security context for the kube-controller-manager container.
+	ControllerManager *corev1.SecurityContext `json:"controllerManager,omitempty"`
+	// Scheduler defines the security context for the kube-scheduler container.
+	Scheduler *corev1.SecurityContext `json:"scheduler,omitempty"`
 }
 
 type DeploymentSpec struct {
@@ -293,6 +327,12 @@ type DeploymentSpec struct {
 	//+kubebuilder:default="default"
 	// ServiceAccountName allows to specify the service account to be mounted to the pods of the Control plane deployment
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+	// AutomountServiceAccountToken allows to enable the automatic mounting of the service account token to the pods of the Control plane deployment
+	AutomountServiceAccountToken *bool `json:"automountServiceAccountToken,omitempty"`
+	// ContainerSecurityContexts allows to specify the security context for the individual control plane components.
+	ContainerSecurityContexts *ControlPlaneContainerSecurityContexts `json:"containerSecurityContexts,omitempty"`
+	// PodSecurityContext allows to specify the security context for the control plane pod.
+	PodSecurityContext *corev1.PodSecurityContext `json:"podSecurityContext,omitempty"`
 }
 
 // AdditionalVolumeMounts allows mounting additional volumes to the Control Plane components.
@@ -318,6 +358,33 @@ type ServiceSpec struct {
 	AdditionalPorts []AdditionalPort `json:"additionalPorts,omitempty"`
 	// ServiceType allows specifying how to expose the Tenant Control Plane.
 	ServiceType ServiceType `json:"serviceType"`
+	// AllocateLoadBalancerNodePorts defines whether NodePorts are automatically allocated
+	// for the Service when serviceType is LoadBalancer. It maps directly to the Service's
+	// spec.allocateLoadBalancerNodePorts. When nil, the Kubernetes default (true) applies,
+	// preserving existing behaviour. Set to false to expose the Tenant Control Plane only
+	// via the LoadBalancer IP and ClusterIP, without a per-node NodePort. This field is only
+	// valid when serviceType is LoadBalancer; setting it with any other serviceType is
+	// rejected by validation.
+	//+optional
+	AllocateLoadBalancerNodePorts *bool `json:"allocateLoadBalancerNodePorts,omitempty"`
+	// IPFamilyPolicy maps directly to the generated Service's spec.ipFamilyPolicy.
+	// When nil, the management cluster default applies, preserving existing behaviour.
+	// PreferDualStack and RequireDualStack describe a dual-stack Service and expect
+	// two entries in ipFamilies; a RequireDualStack policy that cannot be satisfied
+	// (for example with a single family) is rejected by the API server and surfaces
+	// as a reconcile error.
+	//+optional
+	//+kubebuilder:validation:Enum=SingleStack;PreferDualStack;RequireDualStack
+	IPFamilyPolicy *corev1.IPFamilyPolicy `json:"ipFamilyPolicy,omitempty"`
+	// IPFamilies maps directly to the generated Service's spec.ipFamilies. Order is
+	// significant: the first entry is the primary family. When empty, the management
+	// cluster default applies. A Service's IP families cannot be reduced or swapped
+	// after creation (only a single-stack Service may be upgraded to dual-stack);
+	// forbidden transitions are rejected by the API server and surface as a reconcile error.
+	//+optional
+	//+kubebuilder:validation:MaxItems=2
+	//+kubebuilder:validation:items:Enum=IPv4;IPv6
+	IPFamilies []corev1.IPFamily `json:"ipFamilies,omitempty"`
 }
 
 // AddonSpec defines the spec for every addon.
@@ -370,6 +437,8 @@ type KonnectivityServerSpec struct {
 	// Resources define the amount of CPU and memory to allocate to the Konnectivity server.
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 	ExtraArgs ExtraArgs                    `json:"extraArgs,omitempty"`
+	// SecurityContext defines the SecurityContext for the Konnectivity server container.
+	SecurityContext *corev1.SecurityContext `json:"securityContext,omitempty"`
 }
 
 type KonnectivityAgentMode string
@@ -460,7 +529,10 @@ type DataStoreOverride struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.dataStoreUsername) || has(self.dataStoreUsername)", message="unsetting the dataStoreUsername is not supported"
 // +kubebuilder:validation:XValidation:rule="!has(self.networkProfile.loadBalancerSourceRanges) || (size(self.networkProfile.loadBalancerSourceRanges) == 0 || self.controlPlane.service.serviceType == 'LoadBalancer')", message="LoadBalancer source ranges are supported only with LoadBalancer service type"
 // +kubebuilder:validation:XValidation:rule="!has(self.networkProfile.loadBalancerClass) || self.controlPlane.service.serviceType == 'LoadBalancer'", message="LoadBalancerClass is supported only with LoadBalancer service type"
+// +kubebuilder:validation:XValidation:rule="!has(self.controlPlane.service.allocateLoadBalancerNodePorts) || self.controlPlane.service.serviceType == 'LoadBalancer'", message="allocateLoadBalancerNodePorts is supported only with LoadBalancer service type"
 // +kubebuilder:validation:XValidation:rule="self.controlPlane.service.serviceType != 'LoadBalancer' || (oldSelf.controlPlane.service.serviceType != 'LoadBalancer' && self.controlPlane.service.serviceType == 'LoadBalancer') || has(self.networkProfile.loadBalancerClass) == has(oldSelf.networkProfile.loadBalancerClass)",message="LoadBalancerClass cannot be set or unset at runtime"
+// +kubebuilder:validation:XValidation:rule="!has(self.controlPlane.service.ipFamilyPolicy) || self.controlPlane.service.ipFamilyPolicy != 'SingleStack' || !has(self.controlPlane.service.ipFamilies) || size(self.controlPlane.service.ipFamilies) <= 1", message="ipFamilies must contain at most one entry when ipFamilyPolicy is SingleStack"
+// +kubebuilder:validation:XValidation:rule="!has(self.controlPlane.service.ipFamilies) || size(self.controlPlane.service.ipFamilies) < 2 || self.controlPlane.service.ipFamilies[0] != self.controlPlane.service.ipFamilies[1]", message="ipFamilies entries must be unique"
 
 type TenantControlPlaneSpec struct {
 	// WritePermissions allows to select which operations (create, delete, update) must be blocked:

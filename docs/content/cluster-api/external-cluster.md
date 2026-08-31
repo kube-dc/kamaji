@@ -149,7 +149,8 @@ Install cert-manager:
 helm upgrade --install cert-manager jetstack/cert-manager \
   --namespace cert-manager \
   --create-namespace \
-  --set installCRDs=true
+  --version v1.18.3 \
+  --set crds.enabled=true
 ```
 
 Install Kamaji:

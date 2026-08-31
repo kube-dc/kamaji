@@ -130,9 +130,36 @@ func (r *KubernetesServiceResource) mutate(ctx context.Context, tenantControlPla
 
 		r.resource.Spec.Ports = ports
 
+		// IP families are a pure passthrough to the native Service fields. Only
+		// write them when the user set them, so an unset spec leaves the
+		// API-server-defaulted values in place (no reconcile churn).
+		if policy := tenantControlPlane.Spec.ControlPlane.Service.IPFamilyPolicy; policy != nil {
+			r.resource.Spec.IPFamilyPolicy = policy
+		}
+
+		if families := tenantControlPlane.Spec.ControlPlane.Service.IPFamilies; len(families) > 0 {
+			r.resource.Spec.IPFamilies = families
+		}
+
 		switch tenantControlPlane.Spec.ControlPlane.Service.ServiceType {
 		case kamajiv1alpha1.ServiceTypeLoadBalancer:
 			r.resource.Spec.Type = corev1.ServiceTypeLoadBalancer
+
+			// AllocateLoadBalancerNodePorts is a declarative knob: an unset (nil) field
+			// means "use the Kubernetes LoadBalancer default" (true). We write that default
+			// explicitly so that clearing the field reverts the Service to the default, and
+			// so reconciles do not churn — writing the same `true` the API server already
+			// defaults to produces no diff, unlike writing nil over a server-defaulted true.
+			allocate := ptr.Deref(tenantControlPlane.Spec.ControlPlane.Service.AllocateLoadBalancerNodePorts, true)
+			r.resource.Spec.AllocateLoadBalancerNodePorts = &allocate
+			// Kubernetes does not deallocate an already-assigned NodePort when allocation
+			// is turned off, and the port loop above copies the live NodePort back, so clear
+			// it explicitly when allocation is disabled.
+			if !allocate {
+				for i := range r.resource.Spec.Ports {
+					r.resource.Spec.Ports[i].NodePort = 0
+				}
+			}
 
 			if tenantControlPlane.Spec.NetworkProfile.LoadBalancerClass != nil {
 				r.resource.Spec.LoadBalancerClass = ptr.To(*tenantControlPlane.Spec.NetworkProfile.LoadBalancerClass)

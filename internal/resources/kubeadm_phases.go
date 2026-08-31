@@ -203,18 +203,13 @@ func (r *KubeadmPhase) GetKubeadmFunction(ctx context.Context, tcp *kamajiv1alph
 				_ = os.WriteFile(fmt.Sprintf("%s/%s", tmp, i), kubeconfigValue, os.ModePerm)
 			}
 
-			// k8s v1.36.1 added a *kubeadmapi.APIEndpoint parameter to
-			// EnsureAdminClusterRoleBinding (kubeadm internal API change).
-			// Mirror upstream: build the local API endpoint from the TCP's
-			// in-cluster service DNS + configured port. The actual clients
-			// are still supplied by the EnsureRBACFunc closure below.
 			localAPIEndpoint := kubeadmapi.APIEndpoint{
 				AdvertiseAddress: fmt.Sprintf("%s.%s.svc", tcp.Name, tcp.Namespace),
 				BindPort:         tcp.Spec.NetworkProfile.Port,
 			}
 
-			if _, err = kubeconfig.EnsureAdminClusterRoleBinding(tmp, &localAPIEndpoint, func(_ context.Context, _ clientset.Interface, _ clientset.Interface, duration time.Duration, duration2 time.Duration) (clientset.Interface, error) {
-				return kubeconfig.EnsureAdminClusterRoleBindingImpl(ctx, c, c, duration, duration2)
+			if _, err = kubeconfig.EnsureAdminClusterRoleBinding(tmp, &localAPIEndpoint, func(_ context.Context, _ clientset.Interface, _ clientset.Interface, retryInterval time.Duration, retryTimeout time.Duration) (clientset.Interface, error) {
+				return kubeconfig.EnsureAdminClusterRoleBindingImpl(ctx, c, c, retryInterval, retryTimeout)
 			}); err != nil {
 				return nil, err
 			}

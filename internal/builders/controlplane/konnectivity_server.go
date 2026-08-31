@@ -135,6 +135,8 @@ func (k Konnectivity) buildKonnectivityContainer(tcpVersion string, addon *kamaj
 		podSpec.Containers[index].Resources.Limits = resources.Limits
 		podSpec.Containers[index].Resources.Requests = resources.Requests
 	}
+
+	podSpec.Containers[index].SecurityContext = addon.KonnectivityServerSpec.SecurityContext
 }
 
 func (k Konnectivity) RemovingVolumeMounts(podSpec *corev1.PodSpec) {
@@ -169,12 +171,6 @@ func (k Konnectivity) RemovingVolumes(podSpec *corev1.PodSpec) {
 }
 
 func (k Konnectivity) RemovingKubeAPIServerContainerArg(podSpec *corev1.PodSpec) {
-	// In-place removal of --egress-selector-config-file, preserving the order
-	// of all other args. Going through ArgsFromSliceToMap/ArgsFromMapToSlice
-	// alphabetically sorts the whole slice, racing the main Deployment
-	// builder's mergeAPIServerArgs (user extras appended unsorted at the end)
-	// and churning the pod-template-hash every reconcile. Upstream #1160 lands
-	// the same fix our 451e84a originally carried (now deduped to upstream).
 	found, index := utilities.HasNamedContainer(podSpec.Containers, apiServerContainerName)
 	if !found {
 		return
@@ -209,10 +205,9 @@ func (k Konnectivity) buildVolumeMounts(podSpec *corev1.PodSpec) {
 	if !found {
 		return
 	}
-	// Adding the egress selector config file flag without reordering existing
-	// args (maps don't preserve order; the api-server has order-sensitive
-	// params and user extras are appended unsorted by mergeAPIServerArgs).
-	// Upstream #1160 == our original 451e84a churn fix.
+	// Adding the egress selector config file flag:
+	// we can't rely on maps since not preserving order of arguments,
+	// api-server has sensitive parameters.
 	egressConfigFlag := fmt.Sprintf("--egress-selector-config-file=%s", konnectivityEgressSelectorConfigurationPath)
 
 	var foundFlag bool
