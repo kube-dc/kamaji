@@ -98,7 +98,6 @@ const (
 	TenantClientEndpointClusterIP          = "cluster-ip"
 	TenantClientEndpointObservedAnnotation = "network.kube-dc.com/tenant-client-endpoint-observed"
 	DataStoreEndpointObservedAnnotation    = "network.kube-dc.com/datastore-endpoint-observed"
-	EndpointModeDirect                     = "direct"
 	TenantClientEndpointTokenAnnotation    = "network.kube-dc.com/tenant-client-endpoint-token"
 	EndpointModeExternal                   = "external"
 )

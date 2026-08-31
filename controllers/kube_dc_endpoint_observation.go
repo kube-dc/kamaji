@@ -53,6 +53,13 @@ func (r *TenantControlPlaneReconciler) observeKubeDCDataStoreEndpoint(
 // k8-manager keeps the compatibility alias until every live TCP has published
 // this applied-state proof.
 //
+// The live check runs only while the current fingerprint is not yet
+// acknowledged: once it is, every reconcile must NOT re-check the datastore,
+// or N TenantControlPlanes turn each unrelated reconcile (upstream now fans
+// datastore Secret changes and certificate rotations into reconciles) into an
+// N-connection burst against a shared datastore. Ongoing reachability is the
+// datastore controller's and the rendering path's concern.
+//
 // A non-nil result must be returned by the caller as-is: paired with an error
 // when the route is unreachable or the acknowledgement could not be written,
 // or a one-second requeue when the fingerprint was just recorded (the TCP
@@ -63,6 +70,10 @@ func (r *TenantControlPlaneReconciler) ackKubeDCDataStoreRoute(
 	ds *kamajiv1alpha1.DataStore,
 	dsConnection datastore.Connection,
 ) (*ctrl.Result, error) {
+	if tcp.GetAnnotations()[utilities.DataStoreEndpointObservedAnnotation] == utilities.DataStoreEndpointFingerprint(ds) {
+		return nil, nil
+	}
+
 	if err := dsConnection.Check(ctx); err != nil {
 		log.FromContext(ctx).Error(err, "selected DataStore route is not reachable")
 

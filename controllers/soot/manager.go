@@ -102,6 +102,12 @@ const watchdogProbeInterval = 30 * time.Second
 // informers wedged for hours.
 const watchdogMaxFailures = 5
 
+// pausedRequeueInterval bounds how long a TenantControlPlane whose rendered
+// Deployment is scaled to zero waits before the soot manager checks again.
+// Nothing guarantees an event when the orchestrator scales it back up
+// without touching the TCP, so this is the wake-up backstop.
+const pausedRequeueInterval = 30 * time.Second
+
 // tenantHealthWatchdog probes the per-TCP tenant API every
 // watchdogProbeInterval. After watchdogMaxFailures consecutive
 // failures it annotates the TCP with the soot-failed marker and
@@ -195,13 +201,18 @@ func (m *Manager) tenantHealthWatchdog(
 	}
 }
 
-// deploymentNotAvailable returns true when the rendered Deployment
-// either does not exist, has spec.replicas==0, or has no available
-// replicas. This is the kube-dc lifecycle pause indicator: the
-// orchestrator scales the Deployment to 0 without touching tcp.Spec,
-// so tcp.Status can stay stale at Ready. Reading the Deployment
-// directly avoids that staleness.
-func (m *Manager) deploymentNotAvailable(ctx context.Context, tcp *kamajiv1alpha1.TenantControlPlane) bool {
+// deploymentPaused returns true when the rendered Deployment does not exist
+// or has spec.replicas==0. This is the kube-dc lifecycle pause indicator: the
+// orchestrator scales the Deployment to 0 without touching tcp.Spec, so
+// tcp.Status can stay stale at Ready. Reading the Deployment directly avoids
+// that staleness.
+//
+// It deliberately does NOT consult status.availableReplicas: upstream (#1193)
+// renders readiness probes for the scheduler and controller-manager too, so a
+// non-API container can make the whole pod unavailable while kube-apiserver
+// still answers, and ordinary rollouts pass through availableReplicas==0 as
+// well. Tenant API reachability is the watchdog's job, not this gate's.
+func (m *Manager) deploymentPaused(ctx context.Context, tcp *kamajiv1alpha1.TenantControlPlane) bool {
 	dep := &appsv1.Deployment{}
 	if err := m.AdminClient.Get(ctx, types.NamespacedName{Namespace: tcp.Namespace, Name: tcp.Name}, dep); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -212,7 +223,7 @@ func (m *Manager) deploymentNotAvailable(ctx context.Context, tcp *kamajiv1alpha
 		return false
 	}
 
-	return ptr.Deref(dep.Spec.Replicas, 0) == 0 || dep.Status.AvailableReplicas == 0
+	return ptr.Deref(dep.Spec.Replicas, 0) == 0
 }
 
 func (m *Manager) cleanup(ctx context.Context, req reconcile.Request, tenantControlPlane *kamajiv1alpha1.TenantControlPlane) (err error) {
@@ -310,16 +321,6 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 	v, ok := m.sootMap[request.String()]
 	if ok {
 		switch {
-		case v.endpointObservation != tenantEndpointObservation(tcp):
-			// GetRESTClientConfig is consumed by this long-lived manager, not the
-			// parent TCP reconciler. Stop the old client before acknowledging or
-			// using a new route; keep the finalizer while this is an in-place
-			// transition.
-			if cleanupErr := m.cleanup(ctx, request, nil); cleanupErr != nil {
-				return reconcile.Result{}, cleanupErr
-			}
-
-			return reconcile.Result{RequeueAfter: time.Second}, nil
 		case tcp.Annotations != nil && tcp.Annotations[sootManagerAnnotation] == sootManagerFailedAnnotation:
 			delete(m.sootMap, request.String())
 
@@ -335,14 +336,26 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 			// we don't want to pollute with messages due to broken connection.
 			// Once the TCP will be ready again, the event will be intercepted and the manager started back.
 			return reconcile.Result{}, m.cleanup(ctx, request, tcp)
-		case m.deploymentNotAvailable(ctx, tcp):
-			// External pause path: rendered Deployment has been scaled
-			// to 0 (or has no available replicas) but tcp.Spec replicas
-			// is non-zero, so tcpStatus may still report Ready. Tear
-			// down the soot manager to stop informer retry spam against
-			// the unreachable tenant API. The Deployment-update event
-			// will re-trigger reconcile when replicas come back.
+		case m.deploymentPaused(ctx, tcp):
+			// External pause path: the rendered Deployment has been scaled to 0
+			// but tcp.Spec replicas is non-zero, so tcpStatus may still report
+			// Ready. Tear down the soot manager to stop informer retry spam
+			// against the unreachable tenant API; the paused no-manager path
+			// below requeues until replicas come back.
 			return reconcile.Result{}, m.cleanup(ctx, request, tcp)
+		case v.endpointObservation != tenantEndpointObservation(tcp):
+			// Ordered after the lifecycle cases above on purpose: those must keep
+			// their cleanup(..., tcp) semantics, while this is an in-place client
+			// identity change.
+			// GetRESTClientConfig is consumed by this long-lived manager, not the
+			// parent TCP reconciler. Stop the old client before acknowledging or
+			// using a new route; keep the finalizer while this is an in-place
+			// transition.
+			if cleanupErr := m.cleanup(ctx, request, nil); cleanupErr != nil {
+				return reconcile.Result{}, cleanupErr
+			}
+
+			return reconcile.Result{RequeueAfter: time.Second}, nil
 		case tcp.Status.KubeConfig.Admin.Checksum != v.certificateSha:
 			// The stored kubeconfig to access the Tenant Control Plane has changed:
 			// we need to clean-up and requeue to fetch the updated value.
@@ -370,15 +383,14 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 	// Independent of tcp.Status (which can be stale when an external
 	// orchestrator scales the rendered Deployment to 0 without touching
 	// tcp.Spec.ControlPlane.Deployment.Replicas), check the actual
-	// Deployment. If it has no available replicas the tenant API is
-	// unreachable and starting a soot manager just generates retry spam
-	// for ~3 minutes per cycle until cache-sync timeout. Skip and wait
-	// for the Deployment-update event to re-trigger reconcile when
-	// replicas come back.
-	if m.deploymentNotAvailable(ctx, tcp) {
-		log.FromContext(ctx).Info("skipping start of the soot manager: rendered Deployment has no available replicas")
+	// Deployment. While it is scaled to zero the tenant API is unreachable
+	// and starting a soot manager just generates retry spam for ~3 minutes
+	// per cycle until cache-sync timeout. Skip, and requeue on a bounded
+	// interval because nothing guarantees an event when replicas come back.
+	if m.deploymentPaused(ctx, tcp) {
+		logger.Info("skipping start of the soot manager: rendered Deployment is scaled to zero")
 
-		return reconcile.Result{}, nil
+		return reconcile.Result{RequeueAfter: pausedRequeueInterval}, nil
 	}
 	// Generating the manager and starting it:
 	// in case of any error, reconciling the request to start it back from the beginning.
@@ -570,15 +582,18 @@ func (m *Manager) Reconcile(ctx context.Context, request reconcile.Request) (res
 	completedCh := make(chan struct{})
 	// Starting the manager
 	go func() {
-		if err = mgr.Start(tcpCtx); err != nil {
-			logger.Error(err, "unable to start soot manager")
+		// startErr is goroutine-local on purpose: Reconcile's named return
+		// err must not be shared with this goroutine (data race, and a fast
+		// Start failure could be overwritten by the synchronous return).
+		if startErr := mgr.Start(tcpCtx); startErr != nil {
+			logger.Error(startErr, "unable to start soot manager")
 			// The sootManagerAnnotation is used to propagate the error between reconciliations with its state:
 			// this is required to avoid mutex and prevent concurrent read/write on the soot map
 			annotationErr := m.retryTenantControlPlaneAnnotations(ctx, request, func(annotations map[string]string) {
 				annotations[sootManagerAnnotation] = sootManagerFailedAnnotation
 			})
 			if annotationErr != nil {
-				logger.Error(err, "unable to update TenantControlPlane for soot failed annotation")
+				logger.Error(annotationErr, "unable to update TenantControlPlane for soot failed annotation")
 			}
 			// When the manager cannot start we're enqueuing back the request to take advantage of the backoff factor
 			// of the queue: this is a goroutine and cannot return an error since the manager is running on its own,

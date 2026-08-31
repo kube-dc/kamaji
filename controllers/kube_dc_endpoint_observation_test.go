@@ -119,8 +119,9 @@ func TestAckKubeDCDataStoreRoute(t *testing.T) {
 		t.Fatalf("datastore endpoint observation = %q", got)
 	}
 
-	// Already acknowledged: carry on with the reconcile.
-	res, err = r.ackKubeDCDataStoreRoute(context.Background(), live, ds, checkOnlyConnection{})
+	// Already acknowledged: carry on with the reconcile WITHOUT touching the
+	// datastore — a failing Check must be irrelevant in steady state.
+	res, err = r.ackKubeDCDataStoreRoute(context.Background(), live, ds, checkOnlyConnection{checkErr: injected})
 	if err != nil || res != nil {
 		t.Fatalf("steady state = result %v, err %v", res, err)
 	}
