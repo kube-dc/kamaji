@@ -329,3 +329,23 @@ it). Upstream PR candidate. Platform-side alternative: Envoy Gateway v1.8.x
 Re-attempt uses image `edge-26.8.5-v2-kube-dc`, chart `1.0.11-kube-dc`.
 Also noted on stage: two `Failed`-phase pods of an old b1-cp ReplicaSet on
 master-1 (36–40 days old) — pre-existing garbage, unrelated.
+
+## Merge #2 — stage attempt #2 (2026-08-31 13:08 UTC): ON STAGE, soak running
+
+Image `shalb/kamaji:edge-26.8.5-v2-kube-dc` (sha256:b29fdd9d…), chart
+`1.0.11-kube-dc` (sha256:88fb6313…), fleet `fb067ce`. Codex GO (round 4).
+Startup gate: 0 restarts over 341 s, TCP workers started, the expected
+`TLSRoute is not served` INFO line, no cache-sync errors. Re-render: b1-cp
+Deployment gen 13→14 with scheduler/CM readiness (upstream #1193), fork startup
+5s/10 and k8-manager apiserver 4/10 intact. Pause test: kamaji restores a raw
+Deployment scale-to-0 within ~1 s, so the CP pod bounced; soot tore down on API
+loss and restarted automatically 31 s after the pod returned (one failed start
+recovered via the failed marker; no stale marker). Kubeconfig checksum changed
+once (upstream #1191 checksum inputs; one soot rebuild) then stable ≥10 min.
+Tenant-side checks were blocked by the stage tenant's pre-existing dead CNI
+(Cilium crashlooping since 2026-07-18) — not a kamaji regression. Full gate
+table: `kube-dc/docs/internal/upstream-vs-fork-strategy.md`.
+
+Rollback: `KAMAJI_VERSION=1.0.8-kube-dc`, `KAMAJI_IMAGE_TAG=edge-26.5.2-v12-kube-dc`.
+Next hops (cs/zrh, then cloud) and the provider v3 / shared-manifest change each
+need a separate approval after ≥24 h on stage.
