@@ -299,3 +299,33 @@ Stage acceptance list = the MUST-VERIFY rows of the round-1 review
 and scheduler/CM-only unreadiness NOT tearing soot down; DataStore route and
 rotation fan-out; admin kubeconfig drift incl. IPv6; rendered control plane
 and addons on 1.34/1.35 tenants; chart capability handshake).
+
+## Merge #2 — stage attempt #1 (2026-08-31 12:51–13:05 UTC): BLOCKED, rolled back
+
+Published and pulled back: image `shalb/kamaji:edge-26.8.5-v1-kube-dc`
+(sha256:ae18e7e8…), chart `1.0.10-kube-dc` (sha256:0b3cbbdb…). Stage pinned
+(fleet `aff751c`), HelmRelease upgraded cleanly (CRDs additive, webhooks
+answering, soot + webhook servers up) — but the **main TenantControlPlane
+controller never started**:
+
+    ERROR Could not wait for Cache to sync   kind source: *v1.TLSRoute: timed out
+    ERROR setup problem running manager      -> exit, 4 restarts in 7 min
+
+Root cause: upstream #1162 (gateway-api 1.5.1) owns `TLSRoute` at **v1**;
+every kube-dc cluster's Gateway API CRDs come from Envoy Gateway v1.7.x
+(bundle **v1.4.1**), which serves TLSRoute only as v1alpha2/v1alpha3 (HTTPRoute,
+GRPCRoute, Gateway are v1). Verified identical on stage, cloud, webdock,
+cs/zrh, cs/crk — this would have failed fleet-wide. The tenant control plane
+kept serving throughout (its Deployment was never re-rendered). Rolled back
+with fleet `aed69dd` (chart 1.0.8 / image v12): kamaji Running, 0 restarts,
+TCP Ready, workers started.
+
+Fix in the fork: `e070188` — own each Gateway API kind only when it is served
+at v1 (per-kind discovery; TLSRoute absent → logged, not owned; the gateway
+webhook already refuses the Gateway feature then; no TCP on the fleet uses
+it). Upstream PR candidate. Platform-side alternative: Envoy Gateway v1.8.x
+(bundle v1.5.1, TLSRoute v1 as storage version) — separate change.
+
+Re-attempt uses image `edge-26.8.5-v2-kube-dc`, chart `1.0.11-kube-dc`.
+Also noted on stage: two `Failed`-phase pods of an old b1-cp ReplicaSet on
+master-1 (36–40 days old) — pre-existing garbage, unrelated.
