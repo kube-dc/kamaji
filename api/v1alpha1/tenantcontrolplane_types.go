@@ -400,6 +400,7 @@ type AddonSpec struct {
 // pod-template so that patch changes trigger a rollout automatically.
 type KubeProxyAddonSpec struct {
 	AddonSpec `json:",inline"`
+
 	// ConfigurationJSONPatches contains the RFC 6902 JSON patches applied to the
 	// kube-proxy `config.conf` configuration before it is uploaded to the tenant.
 	// Useful for enabling externally-scrapeable metrics

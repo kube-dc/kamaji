@@ -137,6 +137,7 @@ func tenantClientHost(
 		if apierrors.IsNotFound(err) {
 			return host, nil
 		}
+
 		return "", fmt.Errorf("read legacy tenant API Service %s/%s: %w",
 			tenantControlPlane.GetNamespace(), extName, err)
 	}
@@ -151,6 +152,7 @@ func TenantClientEndpointSelection(tenantControlPlane *kamajiv1alpha1.TenantCont
 	if tenantControlPlane.GetAnnotations()[TenantClientEndpointAnnotation] == TenantClientEndpointClusterIP {
 		return TenantClientEndpointClusterIP
 	}
+
 	return EndpointModeExternal
 }
 
@@ -161,5 +163,6 @@ func DataStoreEndpointFingerprint(dataStore *kamajiv1alpha1.DataStore) string {
 	sort.Strings(management)
 	canonical := strings.Join(endpoints, "\x00") + "\x01" + strings.Join(management, "\x00")
 	sum := sha256.Sum256([]byte(canonical))
+
 	return fmt.Sprintf("%x", sum[:])
 }

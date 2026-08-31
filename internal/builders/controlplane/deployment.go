@@ -89,7 +89,7 @@ func defaultProbe(path string, port int32) *corev1.Probe {
 // they ever served. Liveness/readiness keep upstream's defaults. Any of them
 // can still be overridden per TenantControlPlane through
 // spec.controlPlane.deployment.probes, which applyProbeSetOverrides applies
-// after these defaults. (fork: 8749302)
+// after these defaults. Fork commit 8749302.
 func relaxedStartupProbe(path string, port int32) *corev1.Probe {
 	p := defaultProbe(path, port)
 	p.TimeoutSeconds = 5

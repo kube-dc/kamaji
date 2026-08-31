@@ -1,11 +1,15 @@
+// Copyright 2022 Clastix Labs
+// SPDX-License-Identifier: Apache-2.0
+
 package soot
 
 import (
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
 	"github.com/clastix/kamaji/internal/utilities"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestTenantEndpointObservationUsesExactTransitionToken(t *testing.T) {

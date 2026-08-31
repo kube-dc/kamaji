@@ -1,3 +1,6 @@
+// Copyright 2022 Clastix Labs
+// SPDX-License-Identifier: Apache-2.0
+
 package utilities
 
 import (
@@ -5,12 +8,13 @@ import (
 	"errors"
 	"testing"
 
-	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
 )
 
 type getErrorClient struct {
@@ -27,6 +31,7 @@ func tenantClientFake(t *testing.T, objects ...client.Object) client.Client {
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }
 

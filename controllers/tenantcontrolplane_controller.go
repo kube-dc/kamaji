@@ -92,7 +92,7 @@ type TenantControlPlaneReconcilerConfig struct {
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=tlsroutes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 
-//nolint:maintidx
+//nolint:maintidx,gocyclo // kube-dc: upstream sits at the gocyclo limit; ackKubeDCDataStoreRoute adds one branch.
 func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
@@ -172,6 +172,7 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
+
 	dsConnection, err := datastore.NewStorageConnection(ctx, r.Client, *ds)
 	if err != nil {
 		log.Error(err, "cannot generate the DataStore connection for the given instance")
@@ -179,19 +180,10 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 	defer dsConnection.Close()
-	// DataStore Ready may be stale across an endpoint transition. Prove that
-	// this exact management route is usable before acknowledging its
-	// fingerprint; k8-manager keeps the compatibility alias until every live
-	// TCP has published this applied-state proof.
-	if err := dsConnection.Check(ctx); err != nil {
-		log.Error(err, "selected DataStore route is not reachable")
-
-		return ctrl.Result{}, err
-	}
-	if changed, observeErr := r.observeKubeDCDataStoreEndpoint(ctx, tenantControlPlane, ds); observeErr != nil {
-		return ctrl.Result{}, observeErr
-	} else if changed {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
+	// kube-dc: prove the selected DataStore route and acknowledge it (see
+	// ackKubeDCDataStoreRoute) before anything is rendered against it.
+	if res, ackErr := r.ackKubeDCDataStoreRoute(ctx, tenantControlPlane, ds, dsConnection); res != nil {
+		return *res, ackErr
 	}
 
 	dso, err := r.dataStoreOverride(ctx, tenantControlPlane)
