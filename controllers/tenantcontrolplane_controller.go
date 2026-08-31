@@ -387,15 +387,32 @@ func (r *TenantControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr
 			return ok && v == "migrate"
 		})))
 
-	// Conditionally add Gateway API ownership if available
+	// Conditionally add Gateway API ownership if available. Each kind is
+	// checked at gateway.networking.k8s.io/v1 individually: a cluster whose
+	// Gateway API bundle predates 1.5 serves HTTPRoute/GRPCRoute/Gateway at v1
+	// but TLSRoute only at v1alpha2/v1alpha3, and owning a kind the API server
+	// does not serve at v1 makes the cache sync time out and the manager exit.
 	if utilities.AreGatewayResourcesAvailable(ctx, r.Client, r.DiscoveryClient) {
-		controllerBuilder = controllerBuilder.
-			Owns(&gatewayv1.HTTPRoute{}).
-			Owns(&gatewayv1.GRPCRoute{}).
-			Owns(&gatewayv1.TLSRoute{}).
-			Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
-				return nil
-			}))
+		if utilities.IsGatewayKindAvailable(ctx, r.Client, r.DiscoveryClient, "HTTPRoute") {
+			controllerBuilder = controllerBuilder.Owns(&gatewayv1.HTTPRoute{})
+		}
+
+		if utilities.IsGatewayKindAvailable(ctx, r.Client, r.DiscoveryClient, "GRPCRoute") {
+			controllerBuilder = controllerBuilder.Owns(&gatewayv1.GRPCRoute{})
+		}
+
+		if utilities.IsGatewayKindAvailable(ctx, r.Client, r.DiscoveryClient, "TLSRoute") {
+			controllerBuilder = controllerBuilder.Owns(&gatewayv1.TLSRoute{})
+		} else {
+			ctrl.Log.Info("TLSRoute is not served at gateway.networking.k8s.io/v1; TenantControlPlane will not own TLSRoute objects (Gateway API bundle < 1.5)")
+		}
+
+		if utilities.IsGatewayKindAvailable(ctx, r.Client, r.DiscoveryClient, "Gateway") {
+			controllerBuilder = controllerBuilder.
+				Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
+					return nil
+				}))
+		}
 	}
 
 	return controllerBuilder.
