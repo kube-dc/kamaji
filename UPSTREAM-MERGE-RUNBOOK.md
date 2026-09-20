@@ -448,14 +448,30 @@ cannot reach `proxy.golang.org`. Same recipe as the dagger one — static
 linux/amd64 binary on `shalb/distroless-static:nonroot` at `/manager`, user
 65532 — then `docker push`.
 
-**The fleet was NOT re-pinned to v3.** `infrastructure/capi/providers/kamaji-controlplane-components-kube-dc.yaml`
-is shared by cs/* **and** cloudacropolis, so bumping it rolls all of them at once,
-and regenerating it is not a pure image swap: the committed copy has the
-clusterctl variables expanded to their defaults (`--feature-gates=…=false`,
-`--dynamic-infrastructure-clusters=`) which a raw `kustomize build` would replace
-with `${CACPPK_*}` placeholders, and its embedded KamajiControlPlane CRD is ~385
-lines behind the checked-in one. Regenerate deliberately, re-expand those two
-args, and roll it on its own — not inside a 1.37 window.
+**The fleet IS pinned to v3 (done 2026-09-20).**
+`infrastructure/capi/providers/kamaji-controlplane-components-kube-dc.yaml` is
+shared by cs/zrh, cs/crk, cs/jed, cs/next, cloudacropolis and stage, so all six
+roll together. Regenerating it is **not** a plain image swap, so do it this way:
+
+1. `kustomize build config/default` from the provider worktree.
+2. Re-expand the two clusterctl variables to the defaults this file has always
+   carried — `--feature-gates=…=false` and an empty
+   `--dynamic-infrastructure-clusters=`. A raw build leaves `${CACPPK_*}`
+   placeholders that Flux substitution does not fill.
+3. Swap the image to the kube-dc tag; keep the three leading kustomize warning
+   comments so the diff stays readable.
+4. Diff against the committed copy and expect **only** the image line plus
+   additive CRD schema. Check the object count is unchanged (11) and that no new
+   CEL rules appeared — a rule added to the KamajiControlPlane CRD could
+   invalidate live objects the way the kamaji CRDs can.
+
+Because cloudacropolis also consumes this file, it necessarily moved to a v3
+provider; its kamaji was bumped to 1.0.12-kube-dc in the same session so the
+pair matches. cloud and webdock run no CAPI kamaji provider and stay on
+edge-26.8.5-v2 deliberately.
+
+`sigs.k8s.io/cluster-api` stays at v1.11.6 — CAPI v1beta2 / provider v0.20.0
+remains a separate decision.
 
 ## The failure this fixes (worth recognising again)
 
