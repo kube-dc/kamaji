@@ -366,3 +366,125 @@ findings recorded in `upstream-vs-fork-strategy.md`: fresh-CP VPA bootstrap
 OOM (control-proven on v13), and the single-worker drain deadlock on the CSI
 VolumeAttachment finalizer. Remaining: cloud (remove its TEMPORARY provider
 freeze in a window), provider v3 + shared manifest, pins, upstream PRs.
+
+---
+
+# Merge #3 — clastix/kamaji `26.9.3-edge` (2026-09-20): Kubernetes 1.37
+
+**Why:** the worker-image catalogs in all four CloudSigma regions had already
+been given a v1.37.0 entry and customers were told 1.37 was available, but only
+the node images were ever built. The fork could not host a 1.37 control plane:
+`internal/upgrade/kubeadm_version.go` pinned `KubeadmVersion = "v1.36.0"`, and
+`internal/webhook/handlers/tcp_version.go` refuses any TenantControlPlane above
+that ceiling. Picking 1.37 in the console produced a **silent drift**, not an
+error — see "The failure this fixes" below.
+
+Merged at upstream master `1c3d84a`, four commits past the `26.9.3-edge` tag.
+
+## What's in the merge
+
+- `KubeadmVersion` v1.36.0 → **v1.37.0** (the whole point).
+- k8s libraries 1.36 → **1.37** (`k8s.io/kubernetes v1.37.0`, `k8s.io/* v0.37.0`,
+  `controller-runtime v0.24.1 → v0.25.1`).
+- Additive API surface: `konnectivity.agent.resources`, and stricter CEL on
+  existing fields — `serviceCidrs`/`podCidrs` may not hold two CIDRs of the same
+  IP family; `kubelet.preferredAddressTypes` capped at 5 unique entries
+  (`listType` set → atomic).
+- `DefaultKubernetesVersion` (e2e only) v1.35.7 → v1.37.0.
+
+## Conflicts (3) and resolution
+
+| File | Resolution |
+|---|---|
+| `go.mod` | Took upstream's versions wholesale, then `go mod tidy`. |
+| `charts/kamaji-crds/hack/…_datastores_spec.yaml` | Regenerated, not hand-merged. |
+| `charts/kamaji/crds/…_datastores.yaml` | Regenerated, not hand-merged. |
+
+Both datastore CRDs were rebuilt with `make manifests` from the merged Go types,
+so our `managementEndpoints` field and upstream's new IPv6-bracket CEL rule both
+survive — and the rule now also covers `managementEndpoints`, which is what we
+want (it is the same shape of field).
+
+## Verification performed
+
+- `go build`, `go vet`, full unit suite **including** the `api/v1alpha1` envtest
+  specs (59/59). That suite needs `KUBEBUILDER_ASSETS`; without it the only
+  failure you will see is `fork/exec …/etcd: no such file or directory`:
+  `bin/setup-envtest use 1.31.0 --bin-dir $PWD/bin -p path`.
+- **Pre-flight against the new CEL rules before rolling:** every live
+  TenantControlPlane on stage, cs/zrh, cs/crk, cs/jed and cs/next (43 of them)
+  was checked for same-family CIDR pairs and for oversized/duplicate
+  `preferredAddressTypes`. Zero violations. Do this every time upstream tightens
+  validation — the HelmRelease uses `crds: CreateReplace`, so a stricter schema
+  lands immediately and would start rejecting **updates** to an offending object.
+- Per cluster after the roll: live Deployment image (never the HR condition
+  alone), pod ready + 0 restarts, CRD carries the new rules, 0 error lines in
+  5 minutes of controller log, and a server dry-run probe:
+  v1.37.0 create **admitted**, v1.38.0 create **still denied**.
+
+## Release artifacts
+
+| Artifact | Tag |
+|---|---|
+| `shalb/kamaji` | `edge-26.9.3-v1-kube-dc` |
+| chart `shalb/kamaji` | `1.0.12-kube-dc` |
+| `shalb/cluster-api-control-plane-provider-kamaji` | `v0.19.0-kube-dc-v3` |
+
+Branches: `kube-dc-merge-1.37` (fork), `kube-dc-kamaji-1.37` (provider).
+
+## Companion provider: bumped, but NOT required for 1.37
+
+The provider fork has **no version ceiling of its own** — it copies
+`kcp.Spec.Version` straight into the TenantControlPlane
+(`controllers/kamajicontrolplane_controller_tcp.go`). So the kamaji image alone
+unblocks 1.37, and `v0.19.0-kube-dc-v3` is library alignment: the provider
+builds against the fork through `replace github.com/clastix/kamaji => ../kamaji`,
+so its module graph must move to k8s 0.37 / controller-runtime 0.25.1 or it
+stops compiling. `sigs.k8s.io/cluster-api` stays at v1.11.6 (CAPI v1beta2 /
+provider v0.20.0 remains a separate decision).
+
+The image was built on the host, not through dagger: the in-cluster engine
+cannot reach `proxy.golang.org`. Same recipe as the dagger one — static
+linux/amd64 binary on `shalb/distroless-static:nonroot` at `/manager`, user
+65532 — then `docker push`.
+
+**The fleet was NOT re-pinned to v3.** `infrastructure/capi/providers/kamaji-controlplane-components-kube-dc.yaml`
+is shared by cs/* **and** cloudacropolis, so bumping it rolls all of them at once,
+and regenerating it is not a pure image swap: the committed copy has the
+clusterctl variables expanded to their defaults (`--feature-gates=…=false`,
+`--dynamic-infrastructure-clusters=`) which a raw `kustomize build` would replace
+with `${CACPPK_*}` placeholders, and its embedded KamajiControlPlane CRD is ~385
+lines behind the checked-in one. Regenerate deliberately, re-expand those two
+args, and roll it on its own — not inside a 1.37 window.
+
+## The failure this fixes (worth recognising again)
+
+`cs-m-yassin-0a5cae54/tst-cls2-myassin` in jed sat wrong for three days and
+nothing alerted:
+
+- KdcCluster `spec.version: v1.37.0`, **`status.phase: Ready`**
+- KamajiControlPlane spec v1.37.0, status v1.36.2, with the real reason buried in
+  `TenantControlPlaneCreated=False … admission webhook denied`
+- TenantControlPlane still v1.36.2, node kubelet still v1.36.2
+- a v1.37.0 MachineSet created 09-17 stuck at 0 replicas, held by CAPI's
+  `ControlPlaneIsStable` preflight (spec ≠ status) — which is the one thing that
+  kept it safe: no worker ever ran ahead of its control plane.
+
+`status.controlPlane.version` did report v1.36.2 truthfully. What is missing is
+a KdcCluster **condition** carrying the KCP's rejection, and a `phase` that is
+not `Ready` while the control plane has refused the requested version. Until
+that exists, a version the fork does not support fails quietly.
+
+The moment the new image rolled in jed the whole chain unblocked itself with no
+manual step: TCP → v1.37.0 Ready, KCP status caught up, the blocked v1.37.0
+MachineSet scaled to 1, the old v1.36.2 set went to 0, and the tenant came back
+healthy (Cilium v1.16.5, CoreDNS, konnectivity, CSI all Running; DNS + a
+CloudSigma NVMe PVC smoke-tested green).
+
+## Known gap carried forward
+
+No cluster-autoscaler exists for 1.37 (every `v1.37.x` 404s on registry.k8s.io
+as of 2026-09-20). An autoscaled 1.37 cluster runs CA `v1.36.1` through
+k8-manager's nearest-lower fallback and emits a `ClusterAutoscalerVersionSkew`
+warning event. That is intended — do not silence it by pinning 1.37 to a 1.36
+tag.
