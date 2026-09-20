@@ -51,6 +51,12 @@ GORELEASER     ?= $(LOCALBIN)/goreleaser
 COSIGN         ?= $(LOCALBIN)/cosign
 SYFT           ?= $(LOCALBIN)/syft
 YQ             ?= $(LOCALBIN)/yq
+
+# Kubernetes API types embedded in the Kamaji API (e.g. appsv1.DeploymentStatus) declare list-map keys on
+# their conditions, although marking them as optional: the API server rejects those schemas, since every
+# x-kubernetes-list-map-keys entry must be required, or have a default value. The following expression
+# patches the generated CRDs by marking as required the list-map keys which are missing a default value.
+CRD_LIST_MAP_KEYS_PATCH = (.. | select(has("x-kubernetes-list-map-keys"))) |= (. as $$schema | .items.required = ((.items.required // []) + ($$schema["x-kubernetes-list-map-keys"] | map(. as $$key | select($$schema.items.properties[$$key] | has("default") | not))) | unique)) | (.. | select(has("required") and (.required | length == 0))) |= del(.required)
 ENVTEST        ?= $(LOCALBIN)/setup-envtest
 
 all: build
@@ -132,7 +138,7 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
-	test -s $(LOCALBIN)/golangci-lint || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.0.2
+	test -s $(LOCALBIN)/golangci-lint || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 
 .PHONY: apidocs-gen
 apidocs-gen: $(APIDOCS_GEN)  ## Download crdoc locally if necessary.
@@ -163,6 +169,9 @@ crds: controller-gen yq
 	$(CONTROLLER_GEN) crd webhook paths="./..." output:stdout | $(YQ) 'select(documentIndex == 1)' > ./charts/kamaji/crds/kamaji.clastix.io_kubeconfiggenerators.yaml
 	$(CONTROLLER_GEN) crd webhook paths="./..." output:stdout | $(YQ) 'select(documentIndex == 2)' > ./charts/kamaji/crds/kamaji.clastix.io_tenantcontrolplanes.yaml
 	$(YQ) -i '. *n load("./charts/kamaji/controller-gen/crd-conversion.yaml")' ./charts/kamaji/crds/kamaji.clastix.io_tenantcontrolplanes.yaml
+	$(YQ) -i '$(CRD_LIST_MAP_KEYS_PATCH)' ./charts/kamaji/crds/kamaji.clastix.io_datastores.yaml
+	$(YQ) -i '$(CRD_LIST_MAP_KEYS_PATCH)' ./charts/kamaji/crds/kamaji.clastix.io_kubeconfiggenerators.yaml
+	$(YQ) -i '$(CRD_LIST_MAP_KEYS_PATCH)' ./charts/kamaji/crds/kamaji.clastix.io_tenantcontrolplanes.yaml
 	# kamaji-crds chart
 	cp ./charts/kamaji/controller-gen/crd-conversion.yaml ./charts/kamaji-crds/hack/crd-conversion.yaml
 	$(YQ) '.spec' ./charts/kamaji/crds/kamaji.clastix.io_datastores.yaml > ./charts/kamaji-crds/hack/kamaji.clastix.io_datastores_spec.yaml
@@ -331,15 +340,25 @@ cleanup: kind
 	$(KIND) delete cluster --name kamaji
 
 .PHONY: e2e
-e2e: env build load helm ginkgo cert-manager gateway-api envoy-gateway ## Create a KinD cluster, install Kamaji on it and run the test suite.
+e2e: env e2e-setup e2e-test
+
+.PHONY: e2e-setup
+e2e-setup: build load helm ginkgo cert-manager gateway-api envoy-gateway ## Create a KinD cluster, install Kamaji on it and run the test suite.
 	$(HELM) upgrade --debug --install kamaji-crds ./charts/kamaji-crds --create-namespace --namespace kamaji-system
 	$(HELM) repo add clastix https://clastix.github.io/charts
 	$(HELM) dependency build ./charts/kamaji
 	$(HELM) upgrade --debug --install kamaji ./charts/kamaji --create-namespace --namespace kamaji-system --set "image.tag=$(VERSION)" --set "image.pullPolicy=Never" --set "telemetry.disabled=true"
 	$(MAKE) datastores
-	$(GINKGO) -v ./e2e
 
 ##@ Document
+
+.PHONY: e2e-redeploy
+e2e-redeploy: build load
+	$(HELM) upgrade --debug --install kamaji ./charts/kamaji --create-namespace --namespace kamaji-system --set "image.tag=$(VERSION)" --set "image.pullPolicy=Never" --set "telemetry.disabled=true"
+
+.PHONY: e2e-test
+e2e-test: build load
+	$(GINKGO) -v ./e2e
 
 CAPI_URL = https://github.com/clastix/cluster-api-control-plane-provider-kamaji.git
 CAPI_DIR := $(shell mktemp -d)

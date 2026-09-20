@@ -47,6 +47,7 @@ import (
 type KubeconfigGeneratorReconciler struct {
 	Client            client.Client
 	NotValidThreshold time.Duration
+	ReconcileTimeout  time.Duration
 	CertificateChan   chan event.GenericEvent
 }
 
@@ -57,6 +58,10 @@ type KubeconfigGeneratorReconciler struct {
 
 func (r *KubeconfigGeneratorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	var cancelFn context.CancelFunc
+	ctx, cancelFn = context.WithTimeout(ctx, r.ReconcileTimeout)
+	defer cancelFn()
 
 	logger.Info("reconciling resource")
 
@@ -285,7 +290,7 @@ func (r *KubeconfigGeneratorReconciler) generate(ctx context.Context, generator 
 			Usages:       []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		},
 		NotAfter:            util.StartTimeUTC().Add(kubeadmconstants.CertificateValidityPeriod),
-		EncryptionAlgorithm: config.InitConfiguration.ClusterConfiguration.EncryptionAlgorithmType(),
+		EncryptionAlgorithm: config.InitConfiguration.ClusterConfiguration.EncryptionAlgorithm,
 	}
 
 	var caSecret corev1.Secret

@@ -17,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	pointer "k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +39,11 @@ const (
 	dataStoreCertsVolumeName              = "kine-config"
 	kineVolumeCertName                    = "kine-certs"
 )
+
+// kubernetesPKIPath mirrors kubeadm's DefaultCertificatesDir, which is only
+// declared in the versioned kubeadm API packages: keeping a local copy avoids
+// churn every time one of those API versions is dropped.
+const kubernetesPKIPath = "/etc/kubernetes/pki"
 
 const (
 	apiServerFlagsAnnotation = "kube-apiserver.kamaji.clastix.io/args"
@@ -414,19 +418,24 @@ func (d Deployment) buildScheduler(podSpec *corev1.PodSpec, tenantControlPlane k
 		podSpec.Containers = append(podSpec.Containers, corev1.Container{})
 	}
 
-	args := map[string]string{}
-
-	if tenantControlPlane.Spec.ControlPlane.Deployment.ExtraArgs != nil {
-		args = utilities.ArgsFromSliceToMap(tenantControlPlane.Spec.ControlPlane.Deployment.ExtraArgs.Scheduler)
-	}
-
 	kubeconfig := "/etc/kubernetes/scheduler.conf"
 
-	args["--authentication-kubeconfig"] = kubeconfig
-	args["--authorization-kubeconfig"] = kubeconfig
-	args["--bind-address"] = "0.0.0.0"
-	args["--kubeconfig"] = kubeconfig
-	args["--leader-elect"] = "true"
+	// Bind to the IPv6 wildcard so the component serves on both families on a
+	// dual-stack pod (and on IPv4 via v4-mapped addresses when the kernel default
+	// bindv6only=0 applies). Operators on hosts with IPv6 disabled in the kernel
+	// must override this to 0.0.0.0 via extraArgs. ExtraArgs are applied last so
+	// they can override any default, consistent with kube-controller-manager.
+	args := map[string]string{
+		"--authentication-kubeconfig": kubeconfig,
+		"--authorization-kubeconfig":  kubeconfig,
+		"--bind-address":              "::",
+		"--kubeconfig":                kubeconfig,
+		"--leader-elect":              "true",
+	}
+
+	if extraArgs := tenantControlPlane.Spec.ControlPlane.Deployment.ExtraArgs; extraArgs != nil {
+		args = utilities.MergeMaps(args, utilities.ArgsFromSliceToMap(extraArgs.Scheduler))
+	}
 
 	podSpec.Containers[index].Name = schedulerContainerName
 	podSpec.Containers[index].Image = tenantControlPlane.Spec.ControlPlane.Deployment.RegistrySettings.KubeSchedulerImage(tenantControlPlane.Spec.Kubernetes.Version)
@@ -498,20 +507,28 @@ func (d Deployment) buildControllerManager(podSpec *corev1.PodSpec, tenantContro
 		"--allocate-node-cidrs":              "true",
 		"--authentication-kubeconfig":        kubeconfig,
 		"--authorization-kubeconfig":         kubeconfig,
-		"--bind-address":                     "0.0.0.0",
-		"--client-ca-file":                   path.Join(v1beta3.DefaultCertificatesDir, constants.CACertName),
+		"--bind-address":                     "::",
+		"--client-ca-file":                   path.Join(kubernetesPKIPath, constants.CACertName),
 		"--cluster-name":                     tenantControlPlane.GetName(),
-		"--cluster-signing-cert-file":        path.Join(v1beta3.DefaultCertificatesDir, constants.CACertName),
-		"--cluster-signing-key-file":         path.Join(v1beta3.DefaultCertificatesDir, constants.CAKeyName),
+		"--cluster-signing-cert-file":        path.Join(kubernetesPKIPath, constants.CACertName),
+		"--cluster-signing-key-file":         path.Join(kubernetesPKIPath, constants.CAKeyName),
 		"--controllers":                      "*,bootstrapsigner,tokencleaner",
 		"--kubeconfig":                       kubeconfig,
 		"--leader-elect":                     "true",
 		"--service-cluster-ip-range":         strings.Join(serviceCIDRs, ","),
 		"--cluster-cidr":                     strings.Join(podCIDRs, ","),
-		"--requestheader-client-ca-file":     path.Join(v1beta3.DefaultCertificatesDir, constants.FrontProxyCACertName),
-		"--root-ca-file":                     path.Join(v1beta3.DefaultCertificatesDir, constants.CACertName),
-		"--service-account-private-key-file": path.Join(v1beta3.DefaultCertificatesDir, constants.ServiceAccountPrivateKeyName),
+		"--requestheader-client-ca-file":     path.Join(kubernetesPKIPath, constants.FrontProxyCACertName),
+		"--root-ca-file":                     path.Join(kubernetesPKIPath, constants.CACertName),
+		"--service-account-private-key-file": path.Join(kubernetesPKIPath, constants.ServiceAccountPrivateKeyName),
 		"--use-service-account-credentials":  "true",
+	}
+
+	// kube-controller-manager already derives 24/64 for a dual-stack cluster-cidr;
+	// setting them explicitly pins the node CIDR sizes so a change to the upstream
+	// defaults cannot silently resize tenant node CIDRs. Both stay overridable.
+	if len(podCIDRs) > 1 {
+		args["--node-cidr-mask-size-ipv4"] = "24"
+		args["--node-cidr-mask-size-ipv6"] = "64"
 	}
 
 	if extraArgs := tenantControlPlane.Spec.ControlPlane.Deployment.ExtraArgs; extraArgs != nil && len(extraArgs.ControllerManager) > 0 {
@@ -566,7 +583,7 @@ func (d Deployment) buildControllerManager(podSpec *corev1.PodSpec, tenantContro
 	d.ensureVolumeMount(&volumeMounts, corev1.VolumeMount{
 		Name:      kubernetesPKIVolumeName,
 		ReadOnly:  true,
-		MountPath: v1beta3.DefaultCertificatesDir,
+		MountPath: kubernetesPKIPath,
 	})
 	d.ensureVolumeMount(&volumeMounts, corev1.VolumeMount{
 		Name:      caCertificatesVolumeName,
@@ -667,7 +684,7 @@ func (d Deployment) buildKubeAPIServer(podSpec *corev1.PodSpec, tenantControlPla
 	d.ensureVolumeMount(&volumeMounts, corev1.VolumeMount{
 		Name:      kubernetesPKIVolumeName,
 		ReadOnly:  true,
-		MountPath: v1beta3.DefaultCertificatesDir,
+		MountPath: kubernetesPKIPath,
 	})
 	d.ensureVolumeMount(&volumeMounts, corev1.VolumeMount{
 		Name:      caCertificatesVolumeName,
@@ -743,21 +760,21 @@ func (d Deployment) buildKubeAPIServerCommand(tenantControlPlane kamajiv1alpha1.
 	// Managed flags: derived from the TCP spec, always applied, override any user duplicate.
 	managed := map[string]string{
 		"--advertise-address":                apiAdvertiseAddress,
-		"--client-ca-file":                   path.Join(v1beta3.DefaultCertificatesDir, constants.CACertName),
+		"--client-ca-file":                   path.Join(kubernetesPKIPath, constants.CACertName),
 		"--enable-admission-plugins":         strings.Join(tenantControlPlane.Spec.Kubernetes.AdmissionControllers.ToSlice(), ","),
 		"--service-cluster-ip-range":         strings.Join(serviceCIDRs, ","),
-		"--kubelet-client-certificate":       path.Join(v1beta3.DefaultCertificatesDir, constants.APIServerKubeletClientCertName),
-		"--kubelet-client-key":               path.Join(v1beta3.DefaultCertificatesDir, constants.APIServerKubeletClientKeyName),
+		"--kubelet-client-certificate":       path.Join(kubernetesPKIPath, constants.APIServerKubeletClientCertName),
+		"--kubelet-client-key":               path.Join(kubernetesPKIPath, constants.APIServerKubeletClientKeyName),
 		"--kubelet-preferred-address-types":  strings.Join(kubeletPreferredAddressTypes, ","),
-		"--proxy-client-cert-file":           path.Join(v1beta3.DefaultCertificatesDir, constants.FrontProxyClientCertName),
-		"--proxy-client-key-file":            path.Join(v1beta3.DefaultCertificatesDir, constants.FrontProxyClientKeyName),
+		"--proxy-client-cert-file":           path.Join(kubernetesPKIPath, constants.FrontProxyClientCertName),
+		"--proxy-client-key-file":            path.Join(kubernetesPKIPath, constants.FrontProxyClientKeyName),
 		"--requestheader-allowed-names":      constants.FrontProxyClientCertCommonName,
-		"--requestheader-client-ca-file":     path.Join(v1beta3.DefaultCertificatesDir, constants.FrontProxyCACertName),
+		"--requestheader-client-ca-file":     path.Join(kubernetesPKIPath, constants.FrontProxyCACertName),
 		"--secure-port":                      fmt.Sprintf("%d", tenantControlPlane.Spec.NetworkProfile.Port),
-		"--service-account-key-file":         path.Join(v1beta3.DefaultCertificatesDir, constants.ServiceAccountPublicKeyName),
-		"--service-account-signing-key-file": path.Join(v1beta3.DefaultCertificatesDir, constants.ServiceAccountPrivateKeyName),
-		"--tls-cert-file":                    path.Join(v1beta3.DefaultCertificatesDir, constants.APIServerCertName),
-		"--tls-private-key-file":             path.Join(v1beta3.DefaultCertificatesDir, constants.APIServerKeyName),
+		"--service-account-key-file":         path.Join(kubernetesPKIPath, constants.ServiceAccountPublicKeyName),
+		"--service-account-signing-key-file": path.Join(kubernetesPKIPath, constants.ServiceAccountPrivateKeyName),
+		"--tls-cert-file":                    path.Join(kubernetesPKIPath, constants.APIServerCertName),
+		"--tls-private-key-file":             path.Join(kubernetesPKIPath, constants.APIServerKeyName),
 	}
 
 	switch d.DataStore.Spec.Driver {
@@ -781,6 +798,13 @@ func (d Deployment) buildKubeAPIServerCommand(tenantControlPlane kamajiv1alpha1.
 	if len(d.DataStoreOverrides) != 0 {
 		managed["--etcd-servers-overrides"] = d.etcdServersOverrides()
 	}
+	// The Konnectivity addon flag is rendered together with the managed flags,
+	// in sorted position, so that the argument list is deterministic from the
+	// first reconcile pass. Appending it later (as done previously) caused a
+	// second, no-op rollout of every TenantControlPlane (clastix/kamaji#1281).
+	if tenantControlPlane.Spec.Addons.Konnectivity != nil {
+		managed[egressSelectorConfigurationFlag] = konnectivityEgressSelectorConfigurationPath
+	}
 
 	return mergeAPIServerArgs(current, userExtras, safeDefaults, managed)
 }
@@ -790,8 +814,8 @@ func (d Deployment) buildKubeAPIServerCommand(tenantControlPlane kamajiv1alpha1.
 // - user ExtraArgs are preserved verbatim, duplicates included for repeatable flags;
 // - safe defaults fill in only for flag names the user didn't provide.
 //
-// Flags already on the container that Kamaji doesn't own and the user didn't set are kept
-// (e.g. --egress-selector-config-file injected by the Konnectivity addon).
+// Flags already on the container that Kamaji doesn't own and the user didn't set are kept,
+// e.g. flags injected by addons on a previous pass.
 func mergeAPIServerArgs(current, userExtras []string, safeDefaults, managed map[string]string) []string {
 	userFlags := sets.New[string]()
 	// sanitizedExtras will contain the userExtras arguments,

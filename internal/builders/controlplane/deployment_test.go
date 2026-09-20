@@ -4,6 +4,7 @@
 package controlplane
 
 import (
+	"slices"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -207,6 +208,46 @@ var _ = Describe("Controlplane Deployment", func() {
 		})
 	})
 
+	Describe("Konnectivity egress selector flag", func() {
+		var tcp kamajiv1alpha1.TenantControlPlane
+
+		JustBeforeEach(func() {
+			tcp = kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.Addons.Konnectivity = &kamajiv1alpha1.KonnectivitySpec{}
+			tcp.Spec.NetworkProfile.Port = 7443
+		})
+
+		It("renders the flag in sorted position when the addon is enabled", func() {
+			got := d.buildKubeAPIServerCommand(tcp, "1.2.3.4", nil)
+
+			Expect(got).To(ContainElement(egressSelectorConfigurationFlag + "=" + konnectivityEgressSelectorConfigurationPath))
+			Expect(slices.IsSorted(got)).To(BeTrue())
+			// In the sorted segment, the egress selector flag lands between
+			// --client-ca-file and --enable-admission-plugins.
+			Expect(utilities.ArgsFromSliceToMap(got)).To(HaveKey(egressSelectorConfigurationFlag))
+		})
+
+		It("omits the flag when the addon is disabled", func() {
+			tcp.Spec.Addons.Konnectivity = nil
+
+			got := d.buildKubeAPIServerCommand(tcp, "1.2.3.4", nil)
+
+			Expect(got).NotTo(ContainElement(ContainSubstring(egressSelectorConfigurationFlag + "=")))
+		})
+
+		It("is deterministic across reconciler passes, regardless of the current args ordering", func() {
+			first := d.buildKubeAPIServerCommand(tcp, "1.2.3.4", nil)
+			// Simulate the previous buggy flow: the addon appended the flag at
+			// the end of the rendered args on a second pass.
+			dst := slices.Clone(first)
+			dst = append(dst, egressSelectorConfigurationFlag+"="+konnectivityEgressSelectorConfigurationPath)
+			// The next reconcile must not reorder the flags: same spec, same args.
+			second := d.buildKubeAPIServerCommand(tcp, "1.2.3.4", dst)
+
+			Expect(second).To(Equal(first))
+		})
+	})
+
 	Describe("control plane probes", func() {
 		// helper: find a container by name in a built PodSpec
 		containerByName := func(spec *corev1.PodSpec, name string) corev1.Container {
@@ -387,6 +428,71 @@ var _ = Describe("Controlplane Deployment", func() {
 			found, index := utilities.HasNamedContainer(podSpec.Containers, "kine")
 			Expect(found).To(BeTrue())
 			Expect(podSpec.Containers[index].Image).To(Equal("custom-kine:latest"))
+		})
+	})
+
+	Describe("component network flags", func() {
+		containerByName := func(spec *corev1.PodSpec, name string) corev1.Container {
+			for _, c := range spec.Containers {
+				if c.Name == name {
+					return c
+				}
+			}
+			Fail("container not found: " + name)
+
+			return corev1.Container{}
+		}
+
+		It("defaults the scheduler bind-address to the IPv6 wildcard", func() {
+			podSpec := &corev1.PodSpec{}
+			d.buildScheduler(podSpec, kamajiv1alpha1.TenantControlPlane{})
+
+			Expect(containerByName(podSpec, "kube-scheduler").Args).To(ContainElement("--bind-address=::"))
+		})
+
+		It("defaults the controller-manager bind-address to the IPv6 wildcard", func() {
+			podSpec := &corev1.PodSpec{}
+			d.buildControllerManager(podSpec, kamajiv1alpha1.TenantControlPlane{})
+
+			Expect(containerByName(podSpec, "kube-controller-manager").Args).To(ContainElement("--bind-address=::"))
+		})
+
+		It("lets scheduler extraArgs override the bind-address", func() {
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.ControlPlane.Deployment.ExtraArgs = &kamajiv1alpha1.ControlPlaneExtraArgs{
+				Scheduler: []string{"--bind-address=0.0.0.0"},
+			}
+
+			podSpec := &corev1.PodSpec{}
+			d.buildScheduler(podSpec, tcp)
+
+			args := containerByName(podSpec, "kube-scheduler").Args
+			Expect(args).To(ContainElement("--bind-address=0.0.0.0"))
+			Expect(args).ToNot(ContainElement("--bind-address=::"))
+		})
+
+		It("sets per-family node CIDR masks for a dual-stack pod network", func() {
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.NetworkProfile.PodCIDRs = []string{"10.244.0.0/16", "fd00::/64"}
+
+			podSpec := &corev1.PodSpec{}
+			d.buildControllerManager(podSpec, tcp)
+
+			args := containerByName(podSpec, "kube-controller-manager").Args
+			Expect(args).To(ContainElement("--node-cidr-mask-size-ipv4=24"))
+			Expect(args).To(ContainElement("--node-cidr-mask-size-ipv6=64"))
+		})
+
+		It("omits per-family node CIDR masks for a single-stack pod network", func() {
+			tcp := kamajiv1alpha1.TenantControlPlane{}
+			tcp.Spec.NetworkProfile.PodCIDRs = []string{"10.244.0.0/16"}
+
+			podSpec := &corev1.PodSpec{}
+			d.buildControllerManager(podSpec, tcp)
+
+			args := containerByName(podSpec, "kube-controller-manager").Args
+			Expect(args).ToNot(ContainElement("--node-cidr-mask-size-ipv4=24"))
+			Expect(args).ToNot(ContainElement("--node-cidr-mask-size-ipv6=64"))
 		})
 	})
 })
