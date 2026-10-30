@@ -1,0 +1,12 @@
+# Kube-DC 0.9.11 Kamaji candidate
+
+This candidate retains the accepted Kube-DC Kamaji fork and refreshes its
+Go security dependencies, including x/net 0.62.0. The local non-E2E package
+suite passes with Kubernetes 1.35 envtest. The E2E suite now skips by default
+and requires `KAMAJI_E2E_KUBECONFIG` to name an explicit disposable target;
+it does not fall back to the operator's current cluster.
+
+Keep the source revision with any built artifact and qualify it together
+with control-plane provider 0.21 and the configured k8-manager API contract.
+The local package tests do not qualify live provisioning or a customer
+migration. Publication, storage and lifecycle acceptance remain release gates.
