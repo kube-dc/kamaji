@@ -9,7 +9,7 @@ VERSION ?= $(or $(shell git describe --abbrev=0 --tags 2>/dev/null),$(GIT_HEAD_C
 # during testing with the envtest environment. This ensures that 
 # the tests run against the correct API and behavior for the 
 # specific Kubernetes release being targeted (v1.31.0 in this case).
-ENVTEST_K8S_VERSION = 1.31.0
+ENVTEST_K8S_VERSION = 1.35.0
 
 # ENVTEST_VERSION defines the version of the setup-envtest binary 
 # used to manage and download the Kubernetes binaries (like etcd, 
@@ -133,7 +133,7 @@ $(KIND): $(LOCALBIN)
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
 $(CONTROLLER_GEN): $(LOCALBIN)
-	test -s $(LOCALBIN)/controller-gen || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.0
+	test -s $(LOCALBIN)/controller-gen || GOBIN=$(LOCALBIN) CGO_ENABLED=0 go install -ldflags="-s -w" sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
