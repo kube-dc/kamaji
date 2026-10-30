@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	pointer "k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -32,6 +34,9 @@ var (
 )
 
 func TestAPIs(t *testing.T) {
+	if os.Getenv("KAMAJI_E2E_KUBECONFIG") == "" {
+		t.Skip("Set KAMAJI_E2E_KUBECONFIG to an explicit disposable-cluster kubeconfig to run end-to-end tests")
+	}
 	RegisterFailHandler(Fail)
 
 	RunSpecs(t, "Controller Suite")
@@ -46,7 +51,10 @@ var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
 	By("bootstrapping test environment")
+	explicitConfig, configErr := clientcmd.BuildConfigFromFlags("", os.Getenv("KAMAJI_E2E_KUBECONFIG"))
+	Expect(configErr).NotTo(HaveOccurred())
 	testEnv = &envtest.Environment{
+		Config:             explicitConfig,
 		UseExistingCluster: pointer.To(true),
 	}
 
