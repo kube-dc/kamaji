@@ -18,3 +18,8 @@ The candidate selects gRPC 1.83.2, which includes the fix for
 The complete Go package suite passes against explicit Kubernetes 1.35 envtest
 assets with no default live kubeconfig. Runtime images must be rebuilt from
 these dependency locks and qualified separately.
+
+The etcd API/client modules are patched together to 3.7.1. This fixes
+[the TLS listener handshake deadline issue](https://pkg.go.dev/vuln/GO-2026-6107)
+reported by the assembled-image scan. The complete isolated Go suite passes
+again. Image scanning and live acceptance remain separate gates.
