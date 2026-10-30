@@ -10,3 +10,11 @@ Keep the source revision with any built artifact and qualify it together
 with control-plane provider 0.21 and the configured k8-manager API contract.
 The local package tests do not qualify live provisioning or a customer
 migration. Publication, storage and lifecycle acceptance remain release gates.
+
+## Dependency security follow-up
+
+The candidate selects gRPC 1.83.2, which includes the fix for
+[HTTP/2 memory exhaustion](https://github.com/advisories/GHSA-vp52-pcj8-j9qc).
+The complete Go package suite passes against explicit Kubernetes 1.35 envtest
+assets with no default live kubeconfig. Runtime images must be rebuilt from
+these dependency locks and qualified separately.
