@@ -130,6 +130,34 @@ var _ = Describe("Controlplane Deployment", func() {
 		})
 	})
 
+	Describe("etcd compaction interval", func() {
+		etcdDeployment := func() Deployment {
+			return Deployment{DataStore: kamajiv1alpha1.DataStore{Spec: kamajiv1alpha1.DataStoreSpec{
+				Driver:    kamajiv1alpha1.EtcdDriver,
+				Endpoints: kamajiv1alpha1.Endpoints{"etcd-0:2379"},
+			}}}
+		}
+		tcp := func(extra ...string) kamajiv1alpha1.TenantControlPlane {
+			t := kamajiv1alpha1.TenantControlPlane{}
+			t.Spec.NetworkProfile.Port = 6443
+			if len(extra) > 0 {
+				t.Spec.ControlPlane.Deployment.ExtraArgs = &kamajiv1alpha1.ControlPlaneExtraArgs{APIServer: extra}
+			}
+			return t
+		}
+
+		It("defaults to no API server compaction on an etcd DataStore", func() {
+			got := etcdDeployment().buildKubeAPIServerCommand(tcp(), "10.0.0.1", nil)
+			Expect(got).To(ContainElement("--etcd-compaction-interval=0"))
+		})
+
+		It("lets a dedicated etcd DataStore enable API server compaction", func() {
+			got := etcdDeployment().buildKubeAPIServerCommand(tcp("--etcd-compaction-interval=5m"), "10.0.0.1", nil)
+			Expect(got).To(ContainElement("--etcd-compaction-interval=5m"))
+			Expect(got).NotTo(ContainElement("--etcd-compaction-interval=0"))
+		})
+	})
+
 	Describe("mergeAPIServerArgs", func() {
 		var (
 			safeDefaults map[string]string

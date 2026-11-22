@@ -787,7 +787,12 @@ func (d Deployment) buildKubeAPIServerCommand(tenantControlPlane kamajiv1alpha1.
 			httpsEndpoints = append(httpsEndpoints, fmt.Sprintf("https://%s", ep))
 		}
 
-		managed["--etcd-compaction-interval"] = "0"
+		// Compaction defaults to off because a shared etcd DataStore is compacted
+		// globally, by every tenant API server at once. It is a safe default, not
+		// a managed flag, so a TenantControlPlane on a dedicated etcd can enable
+		// it in ExtraArgs (the API server's own compaction is what expires its
+		// watch-cache list snapshots and continue tokens).
+		safeDefaults["--etcd-compaction-interval"] = "0"
 		managed["--etcd-prefix"] = fmt.Sprintf("/%s", tenantControlPlane.Status.Storage.Setup.Schema)
 		managed["--etcd-servers"] = strings.Join(httpsEndpoints, ",")
 		managed["--etcd-cafile"] = "/etc/kubernetes/pki/etcd/ca.crt"
